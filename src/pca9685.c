@@ -88,6 +88,7 @@ int pca9685_set_pwm_us(uint8_t channel, uint16_t pulse_us)
     return 0;
 }
 
+
 int pca9685_init(void)
 {
     int result;
@@ -158,4 +159,9 @@ int pca9685_init(void)
     }
 
     return 0;
+}
+
+int pca9685_recover(void)
+{
+    return pca9685_init();
 }

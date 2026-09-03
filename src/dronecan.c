@@ -12,11 +12,15 @@
 #define ACTUATOR_COUNT 16U
 #define ACTUATOR_FAILSAFE_US 300000U
 #define ACTUATOR_SAFE_PWM_US 1500U
+#define PCA_RECOVERY_INTERVAL_US 1000000U
 
 
 static float actuator_value[ACTUATOR_COUNT];
 static uint8_t actuator_valid[ACTUATOR_COUNT];
 static uint32_t last_actuator_command_us = 0U;
+
+static uint32_t last_pca_recovery_us = 0U;
+static uint8_t pca_fault_active = 0U;
 
 uint32_t micros32(void);
 uint64_t micros64(void);
@@ -25,6 +29,99 @@ static CanardInstance canard;
 static uint8_t canard_memory[CANARD_MEMORY_SIZE];
 
 int pca9685_set_pwm_us(uint8_t channel, uint16_t pulse_us);
+int pca9685_recover(void);
+
+
+static void pca_recovery_process(void)
+{
+    if (pca_fault_active == 0U) {
+        return;
+    }
+
+    const uint32_t now = micros32();
+
+    if ((uint32_t)(now - last_pca_recovery_us) <
+        PCA_RECOVERY_INTERVAL_US) {
+        return;
+    }
+
+    last_pca_recovery_us = now;
+
+    if (pca9685_recover() != 0) {
+        return;
+    }
+
+    /*
+     * PCA9685 successfully re-initialized.
+     *
+     * Restore outputs.
+     */
+
+    if (status_get() == STATUS_ACTUATOR_FAILSAFE) {
+
+        /*
+         * If actuator failsafe is active,
+         * restore safe PWM on all channels.
+         */
+        for (uint8_t channel = 0U;
+             channel < ACTUATOR_COUNT;
+             channel++) {
+
+            if (pca9685_set_pwm_us(
+                    channel,
+                    ACTUATOR_SAFE_PWM_US) < 0) {
+
+                pca_fault_active = 1U;
+                status_set(STATUS_PCA_ERROR);
+                return;
+            }
+        }
+
+    } else {
+
+        /*
+         * Normal mode:
+         * restore last valid actuator values.
+         */
+        for (uint8_t channel = 0U;
+             channel < ACTUATOR_COUNT;
+             channel++) {
+
+            if (actuator_valid[channel] == 0U) {
+                continue;
+            }
+
+            float pwm = actuator_value[channel];
+
+            if (pwm < 500.0F) {
+                pwm = 500.0F;
+            }
+
+            if (pwm > 2500.0F) {
+                pwm = 2500.0F;
+            }
+
+            if (pca9685_set_pwm_us(
+                    channel,
+                    (uint16_t)pwm) < 0) {
+
+                pca_fault_active = 1U;
+                status_set(STATUS_PCA_ERROR);
+                return;
+            }
+        }
+    }
+
+    /*
+     * Recovery and output restoration succeeded.
+     */
+    pca_fault_active = 0U;
+
+    if (status_get() == STATUS_PCA_ERROR) {
+        status_set(STATUS_OK);
+    }
+}
+
 
 static void actuator_failsafe_process(void)
 {
@@ -44,6 +141,7 @@ static void actuator_failsafe_process(void)
                      channel,
                      ACTUATOR_SAFE_PWM_US) < 0) {
 
+                     pca_fault_active = 1U;
                      status_set(STATUS_PCA_ERROR);
                 }
                 
@@ -269,6 +367,7 @@ static void handle_actuator_array_command(CanardRxTransfer *transfer)
                     (uint16_t)pwm);
 
             if (pca_result < 0) {
+                pca_fault_active = 1U;
                 status_set(STATUS_PCA_ERROR);
             } 
 
@@ -368,5 +467,6 @@ void dronecan_process(void)
         break;
     }
     actuator_failsafe_process();
+    pca_recovery_process();
 }
 
