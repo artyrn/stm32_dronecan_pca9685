@@ -1,7 +1,7 @@
 #include <stdint.h>
 
+#include "can_hw.h"
 #include "canard_stm32.h"
-
 /*
  * STM32F103C8T6
  *
@@ -15,9 +15,18 @@
 
 #define RCC_BASE            0x40021000UL
 #define GPIOA_BASE          0x40010800UL
+#define CAN1_BASE           0x40006400UL
 
 #define RCC_APB2ENR         (*(volatile uint32_t *)(RCC_BASE + 0x18))
 #define RCC_APB1ENR         (*(volatile uint32_t *)(RCC_BASE + 0x1C))
+
+#define CAN1_ESR            (*(volatile uint32_t *)(CAN1_BASE + 0x18))
+#define CAN_ESR_EWGF        (1U << 0)
+#define CAN_ESR_EPVF        (1U << 1)
+#define CAN_ESR_BOFF        (1U << 2)
+
+#define CAN_ESR_TEC_SHIFT   16U
+#define CAN_ESR_REC_SHIFT   24U
 
 #define GPIOA_CRH           (*(volatile uint32_t *)(GPIOA_BASE + 0x04))
 
@@ -100,4 +109,40 @@ int can_hw_init(void)
     }
 
     return 0;
+}
+
+
+uint8_t can_hw_get_status(void)
+{
+    const uint32_t esr = CAN1_ESR;
+
+    uint8_t status = 0U;
+
+    if ((esr & CAN_ESR_EWGF) != 0U) {
+        status |= CAN_HW_STATUS_WARNING;
+    }
+
+    if ((esr & CAN_ESR_EPVF) != 0U) {
+        status |= CAN_HW_STATUS_PASSIVE;
+    }
+
+    if ((esr & CAN_ESR_BOFF) != 0U) {
+        status |= CAN_HW_STATUS_BUS_OFF;
+    }
+
+    return status;
+}
+
+
+uint8_t can_hw_get_tec(void)
+{
+    return (uint8_t)(
+        (CAN1_ESR >> CAN_ESR_TEC_SHIFT) & 0xFFU);
+}
+
+
+uint8_t can_hw_get_rec(void)
+{
+    return (uint8_t)(
+        (CAN1_ESR >> CAN_ESR_REC_SHIFT) & 0xFFU);
 }

@@ -6,21 +6,25 @@
 #include "uavcan.protocol.NodeStatus.h"
 #include "uavcan.protocol.GetNodeInfo_res.h"
 #include "uavcan.equipment.actuator.ArrayCommand.h"
+#include "board.h"
+#include "pca9685.h"
+#include "can_hw.h"
 
-#define DRONECAN_NODE_ID     42U
 #define CANARD_MEMORY_SIZE   1024U
-#define ACTUATOR_COUNT 16U
-#define ACTUATOR_FAILSAFE_US 300000U
-#define ACTUATOR_SAFE_PWM_US 1500U
-#define PCA_RECOVERY_INTERVAL_US 1000000U
 
 
 static float actuator_value[ACTUATOR_COUNT];
 static uint8_t actuator_valid[ACTUATOR_COUNT];
 static uint32_t last_actuator_command_us = 0U;
+static uint8_t have_actuator_command = 0U;
 
-static uint32_t last_pca_recovery_us = 0U;
-static uint8_t pca_fault_active = 0U;
+static uint32_t last_pca_recovery_us[PCA9685_DEVICE_COUNT];
+
+static uint8_t pca_fault_active[PCA9685_DEVICE_COUNT];
+
+static uint8_t actuator_failsafe_active = 0U;
+
+static uint32_t actuator_rx_count = 0U;
 
 uint32_t micros32(void);
 uint64_t micros64(void);
@@ -28,161 +32,245 @@ uint64_t micros64(void);
 static CanardInstance canard;
 static uint8_t canard_memory[CANARD_MEMORY_SIZE];
 
-int pca9685_set_pwm_us(uint8_t channel, uint16_t pulse_us);
-int pca9685_recover(void);
+
+static int actuator_to_pca(uint8_t actuator_id,
+                           uint8_t *device,
+                           uint8_t *channel)
+{
+    if ((actuator_id < 1U) ||
+        (actuator_id > ACTUATOR_COUNT)) {
+        return -1;
+    }
+
+    const uint8_t index =
+        (uint8_t)(actuator_id - 1U);
+
+    *device =
+        (uint8_t)(
+            index /
+            PCA9685_CHANNELS_PER_DEVICE);
+
+    *channel =
+        (uint8_t)(
+            index %
+            PCA9685_CHANNELS_PER_DEVICE);
+
+    return 0;
+}
+
+
+static uint16_t pca_status_flag(uint8_t device)
+{
+    return (device == 0U) ?
+        STATUS_FLAG_PCA0_ERROR :
+        STATUS_FLAG_PCA1_ERROR;
+}
 
 
 static void pca_recovery_process(void)
 {
-    if (pca_fault_active == 0U) {
-        return;
-    }
-
     const uint32_t now = micros32();
 
-    if ((uint32_t)(now - last_pca_recovery_us) <
-        PCA_RECOVERY_INTERVAL_US) {
-        return;
-    }
+    for (uint8_t device = 0U;
+         device < PCA9685_DEVICE_COUNT;
+         device++) {
 
-    last_pca_recovery_us = now;
-
-    if (pca9685_recover() != 0) {
-        return;
-    }
-
-    /*
-     * PCA9685 successfully re-initialized.
-     *
-     * Restore outputs.
-     */
-
-    if (status_get() == STATUS_ACTUATOR_FAILSAFE) {
-
-        /*
-         * If actuator failsafe is active,
-         * restore safe PWM on all channels.
-         */
-        for (uint8_t channel = 0U;
-             channel < ACTUATOR_COUNT;
-             channel++) {
-
-            if (pca9685_set_pwm_us(
-                    channel,
-                    ACTUATOR_SAFE_PWM_US) < 0) {
-
-                pca_fault_active = 1U;
-                status_set(STATUS_PCA_ERROR);
-                return;
-            }
+        if (pca_fault_active[device] == 0U) {
+            continue;
         }
 
-    } else {
+        if ((uint32_t)(
+                now - last_pca_recovery_us[device]) <
+            PCA_RECOVERY_INTERVAL_US) {
+            continue;
+        }
+
+        last_pca_recovery_us[device] = now;
+
+        if (pca9685_recover(device) < 0) {
+            status_set_flags(
+                pca_status_flag(device));
+            continue;
+        }
+
+        uint8_t recovery_ok = 1U;
 
         /*
-         * Normal mode:
-         * restore last valid actuator values.
+         * PCA9685 reset loses channel state.
+         * Restore either safe PWM or last
+         * received actuator values.
          */
         for (uint8_t channel = 0U;
-             channel < ACTUATOR_COUNT;
+             channel < PCA9685_CHANNELS_PER_DEVICE;
              channel++) {
 
-            if (actuator_valid[channel] == 0U) {
-                continue;
-            }
+            const uint8_t actuator =
+                (uint8_t)(
+                    device *
+                    PCA9685_CHANNELS_PER_DEVICE +
+                    channel);
 
-            float pwm = actuator_value[channel];
+            uint16_t pwm_us =
+                ACTUATOR_SAFE_PWM_US;
 
-            if (pwm < 500.0F) {
-                pwm = 500.0F;
-            }
+            if ((actuator_failsafe_active == 0U) &&
+                (actuator_valid[actuator] != 0U)) {
 
-            if (pwm > 2500.0F) {
-                pwm = 2500.0F;
+                float pwm =
+                    actuator_value[actuator];
+
+                if (pwm < 500.0F) {
+                    pwm = 500.0F;
+                }
+
+                if (pwm > 2500.0F) {
+                    pwm = 2500.0F;
+                }
+
+                pwm_us = (uint16_t)pwm;
             }
 
             if (pca9685_set_pwm_us(
+                    device,
                     channel,
-                    (uint16_t)pwm) < 0) {
+                    pwm_us) < 0) {
 
-                pca_fault_active = 1U;
-                status_set(STATUS_PCA_ERROR);
-                return;
+                recovery_ok = 0U;
+                break;
             }
         }
-    }
 
-    /*
-     * Recovery and output restoration succeeded.
-     */
-    pca_fault_active = 0U;
+        if (recovery_ok != 0U) {
 
-    if (status_get() == STATUS_PCA_ERROR) {
-        status_set(STATUS_OK);
+            pca_fault_active[device] = 0U;
+
+            status_clear_flags(
+                pca_status_flag(device));
+
+        } else {
+
+            pca_fault_active[device] = 1U;
+
+            status_set_flags(
+                pca_status_flag(device));
+        }
     }
 }
 
 
 static void actuator_failsafe_process(void)
 {
-    static uint8_t failsafe_active = 0U;
-
     const uint32_t now = micros32();
 
-    if ((uint32_t)(now - last_actuator_command_us) >=
-        ACTUATOR_FAILSAFE_US) {
+    const uint8_t timed_out =
+        (have_actuator_command == 0U) ||
+        ((uint32_t)(now - last_actuator_command_us) >=
+         ACTUATOR_FAILSAFE_US);
 
-        if (failsafe_active == 0U) {
-            for (uint8_t channel = 0U;
-                 channel < ACTUATOR_COUNT;
-                 channel++) {
+    if (timed_out == 0U) {
 
-                if (pca9685_set_pwm_us(
-                     channel,
-                     ACTUATOR_SAFE_PWM_US) < 0) {
-
-                     pca_fault_active = 1U;
-                     status_set(STATUS_PCA_ERROR);
-                }
-                
-                actuator_value[channel] =
-                    (float)ACTUATOR_SAFE_PWM_US;
-
-                actuator_valid[channel] = 0U;
-            }
-
-            if (status_get() != STATUS_PCA_ERROR) {
-                status_set(STATUS_ACTUATOR_FAILSAFE);
-            }
-            failsafe_active = 1U;
+        if (actuator_failsafe_active != 0U) {
+                actuator_failsafe_active = 0U;
+                status_clear_flags(STATUS_FLAG_FAILSAFE);
         }
 
         return;
     }
-
-    if (status_get() == STATUS_ACTUATOR_FAILSAFE) {
-        status_set(STATUS_OK);
+    /*
+     * Safe values have already been written.
+     */
+    if (actuator_failsafe_active != 0U) {
+        return;
     }
 
-    failsafe_active = 0U;
+    for (uint8_t actuator = 0U;
+         actuator < ACTUATOR_COUNT;
+         actuator++) {
+
+        const uint8_t device =
+            (uint8_t)(
+                actuator /
+                PCA9685_CHANNELS_PER_DEVICE);
+
+        const uint8_t channel =
+            (uint8_t)(
+                actuator %
+                PCA9685_CHANNELS_PER_DEVICE);
+
+        if (pca9685_set_pwm_us(
+                device,
+                channel,
+                ACTUATOR_SAFE_PWM_US) < 0) {
+
+            pca_fault_active[device] = 1U;
+
+            status_set_flags(
+                pca_status_flag(device));
+        }
+
+        /*
+         * Do not pretend that safe PWM came
+         * from DroneCAN.
+         */
+        actuator_valid[actuator] = 0U;
+
+        actuator_value[actuator] =
+            (float)ACTUATOR_SAFE_PWM_US;
+    }
+
+    actuator_failsafe_active = 1U;
+
+    status_set_flags(
+        STATUS_FLAG_FAILSAFE);
+}
+
+
+static uint8_t node_health_from_status(void)
+{
+    const uint16_t flags =
+        status_get_flags();
+
+    if ((flags & STATUS_FLAG_FATAL) != 0U) {
+
+        return UAVCAN_PROTOCOL_NODESTATUS_HEALTH_CRITICAL;
+    }
+
+    if ((flags &
+        (STATUS_FLAG_CAN_ERROR |
+         STATUS_FLAG_PCA0_ERROR |
+         STATUS_FLAG_PCA1_ERROR)) != 0U) {
+
+        return UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR;
+    }
+
+    if ((flags &
+        (STATUS_FLAG_FAILSAFE |
+         STATUS_FLAG_OLED_ERROR)) != 0U) {
+
+        return UAVCAN_PROTOCOL_NODESTATUS_HEALTH_WARNING;
+    }
+
+    return UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK;
 }
 
 static void send_get_node_info_response(CanardRxTransfer *transfer)
 {
     struct uavcan_protocol_GetNodeInfoResponse response = {0};
 
-    response.status.uptime_sec = micros32() / 1000000U;
-    response.status.health = UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK;
+    response.status.uptime_sec =
+        (uint32_t)(micros64() / 1000000ULL);
+
+    response.status.health = node_health_from_status();
     response.status.mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL;
     response.status.sub_mode = 0U;
-    response.status.vendor_specific_status_code = 0U;
+    response.status.vendor_specific_status_code = status_get_flags();
 
     /*
      * Software version 1.0.
      * Пока VCS commit и image CRC не передаем.
      */
-    response.software_version.major = 1U;
-    response.software_version.minor = 0U;
+    response.software_version.major = FW_VERSION_MAJOR;
+    response.software_version.minor = FW_VERSION_MINOR;
     response.software_version.optional_field_flags = 0U;
     response.software_version.vcs_commit = 0U;
     response.software_version.image_crc = 0U;
@@ -202,8 +290,8 @@ static void send_get_node_info_response(CanardRxTransfer *transfer)
      */
     response.hardware_version.unique_id[0] = 'P';
     response.hardware_version.unique_id[1] = 'C';
-    response.hardware_version.unique_id[2] = 'A';
-    response.hardware_version.unique_id[3] = '1';
+    response.hardware_version.unique_id[2] = '3';
+    response.hardware_version.unique_id[3] = '2';
 
     const volatile uint8_t *stm32_uid =
         (const volatile uint8_t *)0x1FFFF7E8UL;
@@ -218,7 +306,7 @@ static void send_get_node_info_response(CanardRxTransfer *transfer)
      */
     response.hardware_version.certificate_of_authenticity.len = 0U;
 
-    static const char node_name[] = "com.artyrn.pca9685";
+    static const char node_name[] = "com.artyrn.pca9685x2";
 
     response.name.len = sizeof(node_name) - 1U;
 
@@ -337,19 +425,32 @@ static void handle_actuator_array_command(CanardRxTransfer *transfer)
             continue;
         }
 
-        const uint8_t channel =
+        uint8_t device;
+        uint8_t channel;
+
+        if (actuator_to_pca(
+            cmd->actuator_id,
+            &device,
+            &channel) < 0) {
+
+            continue;
+        }
+        const uint8_t actuator =
             (uint8_t)(cmd->actuator_id - 1U);
 
         if (cmd->command_type ==
             UAVCAN_EQUIPMENT_ACTUATOR_COMMAND_COMMAND_TYPE_PWM) {
 
-            actuator_value[channel] =
-                cmd->command_value;
+            actuator_value[actuator] =
+            cmd->command_value;
 
-            actuator_valid[channel] = 1U;
+            actuator_valid[actuator] = 1U;
 
+            have_actuator_command = 1U;
             last_actuator_command_us =
                 micros32();
+
+            actuator_rx_count++;
 
             float pwm = cmd->command_value;
 
@@ -363,20 +464,64 @@ static void handle_actuator_array_command(CanardRxTransfer *transfer)
 
             const int pca_result =
                 pca9685_set_pwm_us(
+                    device,
                     channel,
                     (uint16_t)pwm);
 
             if (pca_result < 0) {
-                pca_fault_active = 1U;
-                status_set(STATUS_PCA_ERROR);
-            } 
 
+                pca_fault_active[device] = 1U;
+
+                status_set_flags(
+                    pca_status_flag(device));
+
+            }
         }
     }
 
     canardReleaseRxTransferPayload(
         &canard,
         transfer);
+}
+
+
+uint32_t dronecan_get_actuator_rx_count(void)
+{
+    return actuator_rx_count;
+}
+
+
+void dronecan_actuator_init(void)
+{
+    const uint16_t flags =
+        status_get_flags();
+
+    pca_fault_active[0U] =
+        ((flags & STATUS_FLAG_PCA0_ERROR) != 0U)
+            ? 1U
+            : 0U;
+
+    pca_fault_active[1U] =
+        ((flags & STATUS_FLAG_PCA1_ERROR) != 0U)
+            ? 1U
+            : 0U;
+
+    /*
+     * No valid DroneCAN actuator command has
+     * been received yet.
+     *
+     * The first actuator_process() call will
+     * therefore enter failsafe and keep all
+     * outputs at their safe values.
+     */
+    have_actuator_command = 0U;
+    actuator_failsafe_active = 0U;
+}
+
+void dronecan_actuator_process(void)
+{
+    actuator_failsafe_process();
+    pca_recovery_process();
 }
 
 
@@ -390,6 +535,7 @@ void dronecan_init(void)
                0);
 
     canardSetLocalNodeID(&canard, DRONECAN_NODE_ID);
+
 }
 
 static void send_node_status(void)
@@ -397,10 +543,10 @@ static void send_node_status(void)
     struct uavcan_protocol_NodeStatus status = {0};
 
     status.uptime_sec = (uint32_t)(micros64() / 1000000ULL);
-    status.health = UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK;
+    status.health = node_health_from_status();
     status.mode = UAVCAN_PROTOCOL_NODESTATUS_MODE_OPERATIONAL;
     status.sub_mode = 0U;
-    status.vendor_specific_status_code = 0U;
+    status.vendor_specific_status_code = status_get_flags();
 
     uint8_t buffer[UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE];
 
@@ -421,32 +567,67 @@ static void send_node_status(void)
 void dronecan_process(void)
 {
     static uint32_t last_status_us = 0U;
+    static uint32_t last_cleanup_us = 0U;
+
 
     const uint32_t now = micros32();
+
+    if ((uint32_t)(now - last_cleanup_us) >=
+        CANARD_RECOMMENDED_STALE_TRANSFER_CLEANUP_INTERVAL_USEC) {
+
+        last_cleanup_us = now;
+
+        canardCleanupStaleTransfers(
+            &canard,
+            micros64());
+    }
 
     if ((uint32_t)(now - last_status_us) >= 1000000U) {
         last_status_us = now;
         send_node_status();
     }
 
+    /*
+     * Transmit queued DroneCAN frames.
+     */
     for (;;) {
-        const CanardCANFrame *frame = canardPeekTxQueue(&canard);
+        const CanardCANFrame *frame =
+            canardPeekTxQueue(&canard);
 
         if (frame == 0) {
             break;
         }
 
-        const int16_t result = canardSTM32Transmit(frame);
+        const int16_t result =
+            canardSTM32Transmit(frame);
 
         if (result > 0) {
+
             canardPopTxQueue(&canard);
+
         } else if (result < 0) {
+
+            /*
+             * Hardware/driver TX error.
+             *
+             * Drop this frame so a permanently
+             * failed frame cannot block the queue.
+             */
             canardPopTxQueue(&canard);
+
         } else {
+
+            /*
+             * No TX mailbox available now.
+             * This is not an error.
+             */
             break;
         }
     }
 
+    /*
+     * Receive all currently available CAN frames.
+     */
     CanardCANFrame rx_frame;
 
     for (;;) {
@@ -454,19 +635,47 @@ void dronecan_process(void)
             canardSTM32Receive(&rx_frame);
 
         if (rx_result > 0) {
-            const uint32_t rx_now = micros32();
+
+
+            const uint64_t rx_now =
+                micros64();
 
             (void)canardHandleRxFrame(
                 &canard,
                 &rx_frame,
-                (uint64_t)rx_now);
+                rx_now);
 
             continue;
         }
 
+
+        /*
+         * rx_result == 0 means no frame available.
+         */
         break;
     }
-    actuator_failsafe_process();
-    pca_recovery_process();
-}
 
+    /*
+     * Current bxCAN hardware state.
+     *
+     * ABOM is enabled by libcanard, so BUS-OFF
+     * recovery itself is performed by bxCAN.
+     */
+    const uint8_t can_status =
+        can_hw_get_status();
+
+    if ((can_status &
+        (CAN_HW_STATUS_WARNING |
+         CAN_HW_STATUS_PASSIVE |
+         CAN_HW_STATUS_BUS_OFF)) != 0U) {
+
+    status_set_flags(
+        STATUS_FLAG_CAN_ERROR);
+
+    } else {
+
+        status_clear_flags(
+            STATUS_FLAG_CAN_ERROR);
+    }
+
+}

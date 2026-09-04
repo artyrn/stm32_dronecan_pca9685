@@ -52,6 +52,7 @@ OBJECTS = \
 	$(BUILD_DIR)/i2c.o \
 	$(BUILD_DIR)/pca9685.o \
 	$(BUILD_DIR)/status.o \
+	$(BUILD_DIR)/oled.o \
 	$(BUILD_DIR)/timebase.o	
 
 all: $(BUILD_DIR)/$(PROJECT).elf \
@@ -82,6 +83,9 @@ $(BUILD_DIR)/i2c.o: src/i2c.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pca9685.o: src/pca9685.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/oled.o: src/oled.c src/oled.h src/i2c.h src/board.h src/status.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 	
 $(BUILD_DIR)/dronecan.o: src/dronecan.c | $(BUILD_DIR)
