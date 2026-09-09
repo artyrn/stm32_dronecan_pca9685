@@ -4,6 +4,7 @@
 
 .global _estack
 .global Reset_Handler
+.global TIM2_IRQHandler
 
 .section .isr_vector,"a",%progbits
 
@@ -46,6 +47,101 @@
 /* SysTick */
 .word Default_Handler
 
+/*
+ * STM32F103 external interrupts.
+ *
+ * IRQ0..IRQ27 are currently unused and go to
+ * Default_Handler.
+ *
+ * IRQ28 = TIM2.
+ */
+
+/* IRQ0  WWDG */
+.word Default_Handler
+
+/* IRQ1  PVD */
+.word Default_Handler
+
+/* IRQ2  TAMPER */
+.word Default_Handler
+
+/* IRQ3  RTC */
+.word Default_Handler
+
+/* IRQ4  FLASH */
+.word Default_Handler
+
+/* IRQ5  RCC */
+.word Default_Handler
+
+/* IRQ6  EXTI0 */
+.word Default_Handler
+
+/* IRQ7  EXTI1 */
+.word Default_Handler
+
+/* IRQ8  EXTI2 */
+.word Default_Handler
+
+/* IRQ9  EXTI3 */
+.word Default_Handler
+
+/* IRQ10 EXTI4 */
+.word Default_Handler
+
+/* IRQ11 DMA1_Channel1 */
+.word Default_Handler
+
+/* IRQ12 DMA1_Channel2 */
+.word Default_Handler
+
+/* IRQ13 DMA1_Channel3 */
+.word Default_Handler
+
+/* IRQ14 DMA1_Channel4 */
+.word Default_Handler
+
+/* IRQ15 DMA1_Channel5 */
+.word Default_Handler
+
+/* IRQ16 DMA1_Channel6 */
+.word Default_Handler
+
+/* IRQ17 DMA1_Channel7 */
+.word Default_Handler
+
+/* IRQ18 ADC1_2 */
+.word Default_Handler
+
+/* IRQ19 USB_HP_CAN1_TX */
+.word Default_Handler
+
+/* IRQ20 USB_LP_CAN1_RX0 */
+.word Default_Handler
+
+/* IRQ21 CAN1_RX1 */
+.word Default_Handler
+
+/* IRQ22 CAN1_SCE */
+.word Default_Handler
+
+/* IRQ23 EXTI9_5 */
+.word Default_Handler
+
+/* IRQ24 TIM1_BRK */
+.word Default_Handler
+
+/* IRQ25 TIM1_UP */
+.word Default_Handler
+
+/* IRQ26 TIM1_TRG_COM */
+.word Default_Handler
+
+/* IRQ27 TIM1_CC */
+.word Default_Handler
+
+/* IRQ28 TIM2 */
+.word TIM2_IRQHandler
 
 .section .text.Reset_Handler
 .type Reset_Handler, %function

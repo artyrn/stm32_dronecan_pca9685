@@ -7,6 +7,7 @@
 #include "dronecan.h"
 #include "can_hw.h"
 #include "canard_stm32.h"
+#include "config.h"
 
 #define SSD1306_CONTROL_COMMAND  0x00U
 #define SSD1306_CONTROL_DATA     0x40U
@@ -179,6 +180,7 @@ static void oled_draw_u32(uint8_t column,
     }
 }
 
+
 static void oled_build_screen(void)
 {
     const uint16_t flags =
@@ -206,18 +208,24 @@ static void oled_build_screen(void)
      * Line 1:
      * PCA0 / PCA1
      */
+    const config_t *cfg = config_get();
+
     if ((flags & STATUS_FLAG_PCA0_ERROR) != 0U) {
         oled_draw_text(0U, 1U, "P0 ERR");
     } else {
         oled_draw_text(0U, 1U, "P0 OK");
     }
 
-    if ((flags & STATUS_FLAG_PCA1_ERROR) != 0U) {
-        oled_draw_text(72U, 1U, "P1 ERR");
+    if (cfg->pca_count >= 2U) {
+        if ((flags & STATUS_FLAG_PCA1_ERROR) != 0U) {
+            oled_draw_text(72U, 1U, "P1 ERR");
+        } else {
+            oled_draw_text(72U, 1U, "P1 OK");
+        }
     } else {
-        oled_draw_text(72U, 1U, "P1 OK");
+        oled_draw_text(72U, 1U, "P1 --");
     }
-
+    
     /*
      * Line 2:
      *
@@ -247,34 +255,31 @@ static void oled_build_screen(void)
      * T = bxCAN transmit error counter
      * R = bxCAN receive error counter
      * O = RX FIFO overflow count
+     * F = status flags
      */
     oled_draw_text(0U, 3U, "T");
+    oled_draw_u32(6U, 3U, can_hw_get_tec());
 
+    oled_draw_text(30U, 3U, "R");
+    oled_draw_u32(36U, 3U, can_hw_get_rec());
+
+    oled_draw_text(60U, 3U, "O");
     oled_draw_u32(
-        12U,
-        3U,
-        can_hw_get_tec());
-
-    oled_draw_text(36U, 3U, "R");
-
-    oled_draw_u32(
-        48U,
-        3U,
-        can_hw_get_rec());
-
-    oled_draw_text(78U, 3U, "O");
-
-    oled_draw_u32(
-        90U,
+        66U,
         3U,
         (uint32_t)can_stats.rx_overflow_count);
 
+    oled_draw_text(90U, 3U, "F");
+    oled_draw_u32(
+        96U,
+        3U,
+        (uint32_t)status_get_flags());
 }
 
 
 static int oled_command(uint8_t command)
 {
-    return i2c1_write(
+    return i2c_write(
         OLED_I2C_ADDRESS,
         SSD1306_CONTROL_COMMAND,
         &command,
@@ -296,8 +301,8 @@ static int oled_send_init(void)
 
         0x20U, 0x00U,
 
-        0xA1U,
-        0xC8U,
+        0xA0U,
+        0xC0U,
 
         0xDAU, 0x02U,
         0x81U, 0x8FU,
@@ -378,7 +383,7 @@ static int oled_clear_display(void)
      * chunks later so CAN processing is not
      * blocked for tens of milliseconds.
      */
-    if (i2c1_write(
+    if (i2c_write(
             OLED_I2C_ADDRESS,
             SSD1306_CONTROL_DATA,
             framebuffer,
@@ -492,7 +497,7 @@ void oled_process(void)
         length = OLED_FLUSH_CHUNK;
     }
 
-    if (i2c1_write(
+    if (i2c_write(
             OLED_I2C_ADDRESS,
             SSD1306_CONTROL_DATA,
             &framebuffer[flush_offset],

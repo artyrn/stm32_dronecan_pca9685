@@ -102,7 +102,7 @@ int pca9685_set_pwm_us(uint8_t device,
         (uint8_t)((counts >> 8) & 0x0FU)
     };
 
-    return i2c1_write(
+    return i2c_write(
         address,
         base,
         data,
@@ -129,7 +129,7 @@ int pca9685_init(uint8_t device)
     /*
      * Sleep before changing PRESCALE.
      */
-    result = i2c1_write_reg(
+    result = i2c_write_reg(
         address,
         PCA9685_MODE1,
         PCA9685_MODE1_SLEEP);
@@ -141,7 +141,7 @@ int pca9685_init(uint8_t device)
     /*
      * 25 MHz oscillator, approximately 50 Hz.
      */
-    result = i2c1_write_reg(
+    result = i2c_write_reg(
         address,
         PCA9685_PRESCALE,
         PCA9685_PRESCALE_50HZ);
@@ -153,7 +153,7 @@ int pca9685_init(uint8_t device)
     /*
      * Totem-pole outputs.
      */
-    result = i2c1_write_reg(
+    result = i2c_write_reg(
         address,
         PCA9685_MODE2,
         PCA9685_MODE2_OUTDRV);
@@ -166,7 +166,7 @@ int pca9685_init(uint8_t device)
      * Wake oscillator and enable register
      * auto-increment.
      */
-    result = i2c1_write_reg(
+    result = i2c_write_reg(
         address,
         PCA9685_MODE1,
         PCA9685_MODE1_AI);
@@ -185,7 +185,7 @@ int pca9685_init(uint8_t device)
      * Restart oscillator and keep
      * auto-increment enabled.
      */
-     result = i2c1_write_reg(
+     result = i2c_write_reg(
         address,
         PCA9685_MODE1,
         PCA9685_MODE1_RESTART |

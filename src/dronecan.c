@@ -9,6 +9,8 @@
 #include "board.h"
 #include "pca9685.h"
 #include "can_hw.h"
+#include "config.h"
+#include "param_server.h"
 
 #define CANARD_MEMORY_SIZE   1024U
 
@@ -17,6 +19,24 @@ static float actuator_value[ACTUATOR_COUNT];
 static uint8_t actuator_valid[ACTUATOR_COUNT];
 static uint32_t last_actuator_command_us = 0U;
 static uint8_t have_actuator_command = 0U;
+
+/*
+ * PULSE runtime state.
+ *
+ * pulse_input_on:
+ *   Last logical state received from DroneCAN.
+ *
+ * pulse_active:
+ *   Output is currently ON and its timer is running.
+ *
+ * pulse_wait_off:
+ *   RETRIG=IGNORE pulse has completed. A new pulse is
+ *   blocked until a real OFF command is received.
+ */
+static uint8_t pulse_input_on[ACTUATOR_COUNT];
+static uint8_t pulse_active[ACTUATOR_COUNT];
+static uint8_t pulse_wait_off[ACTUATOR_COUNT];
+static uint32_t pulse_started_us[ACTUATOR_COUNT];
 
 static uint32_t last_pca_recovery_us[PCA9685_DEVICE_COUNT];
 
@@ -32,33 +52,6 @@ uint64_t micros64(void);
 static CanardInstance canard;
 static uint8_t canard_memory[CANARD_MEMORY_SIZE];
 
-
-static int actuator_to_pca(uint8_t actuator_id,
-                           uint8_t *device,
-                           uint8_t *channel)
-{
-    if ((actuator_id < 1U) ||
-        (actuator_id > ACTUATOR_COUNT)) {
-        return -1;
-    }
-
-    const uint8_t index =
-        (uint8_t)(actuator_id - 1U);
-
-    *device =
-        (uint8_t)(
-            index /
-            PCA9685_CHANNELS_PER_DEVICE);
-
-    *channel =
-        (uint8_t)(
-            index %
-            PCA9685_CHANNELS_PER_DEVICE);
-
-    return 0;
-}
-
-
 static uint16_t pca_status_flag(uint8_t device)
 {
     return (device == 0U) ?
@@ -67,14 +60,116 @@ static uint16_t pca_status_flag(uint8_t device)
 }
 
 
+static uint16_t output_state_pwm(
+    const output_config_t *out,
+    uint8_t state_on)
+{
+    return (state_on != 0U) ?
+        out->on_pwm_us :
+        out->off_pwm_us;
+}
+
+
+static void pulse_reset(uint8_t actuator)
+{
+    pulse_input_on[actuator] = 0U;
+    pulse_active[actuator] = 0U;
+    pulse_wait_off[actuator] = 0U;
+    pulse_started_us[actuator] = 0U;
+}
+
+
+static int write_output_pwm(uint8_t actuator,
+                            uint16_t pwm_us)
+{
+    const uint8_t device =
+        (uint8_t)(
+            actuator /
+            PCA9685_CHANNELS_PER_DEVICE);
+
+    const uint8_t channel =
+        (uint8_t)(
+            actuator %
+            PCA9685_CHANNELS_PER_DEVICE);
+
+    if (pca9685_set_pwm_us(
+            device,
+            channel,
+            pwm_us) < 0) {
+
+        pca_fault_active[device] = 1U;
+
+        status_set_flags(
+            pca_status_flag(device));
+
+        return -1;
+    }
+
+    return 0;
+}
+
+
+static void pulse_process(void)
+{
+    /*
+     * Failsafe owns all outputs while active.
+     * It also resets the pulse state when it enters.
+     */
+    if (actuator_failsafe_active != 0U) {
+        return;
+    }
+
+    const uint32_t now = micros32();
+    const uint8_t output_count =
+        config_get_output_count();
+
+    for (uint8_t actuator = 0U;
+         actuator < output_count;
+         actuator++) {
+
+        const output_config_t *out =
+            config_get_output(actuator);
+
+        if ((out == 0) ||
+            (out->type != OUTPUT_PULSE) ||
+            (pulse_active[actuator] == 0U)) {
+            continue;
+        }
+
+        const uint32_t pulse_time_us =
+            out->pulse_time_ms * 1000U;
+
+        if ((uint32_t)(
+                now - pulse_started_us[actuator]) <
+            pulse_time_us) {
+            continue;
+        }
+
+        (void)write_output_pwm(
+            actuator,
+            out->off_pwm_us);
+
+        pulse_active[actuator] = 0U;
+
+        if ((out->pulse_retrigger == PULSE_IGNORE) &&
+            (pulse_input_on[actuator] != 0U)) {
+
+            pulse_wait_off[actuator] = 1U;
+        }
+    }
+}
+
+
 static void pca_recovery_process(void)
 {
     const uint32_t now = micros32();
 
-    for (uint8_t device = 0U;
-         device < PCA9685_DEVICE_COUNT;
-         device++) {
+    const config_t *cfg = config_get();
 
+    for (uint8_t device = 0U;
+         device < cfg->pca_count;
+         device++) {
+     
         if (pca_fault_active[device] == 0U) {
             continue;
         }
@@ -110,24 +205,61 @@ static void pca_recovery_process(void)
                     PCA9685_CHANNELS_PER_DEVICE +
                     channel);
 
-            uint16_t pwm_us =
-                ACTUATOR_SAFE_PWM_US;
+            const output_config_t *out =
+                config_get_output(actuator);
 
-            if ((actuator_failsafe_active == 0U) &&
+            uint16_t pwm_us =
+                CONFIG_PWM_NEUTRAL_US;
+
+            if (out != 0) {
+
+                if (out->type == OUTPUT_PWM) {
+                    pwm_us =
+                        out->failsafe_pwm_us;
+
+                } else if ((out->type == OUTPUT_ON_OFF) ||
+                           (out->type == OUTPUT_PULSE)) {
+
+                    pwm_us =
+                        output_state_pwm(
+                            out,
+                            out->failsafe_state);
+                }
+            }
+
+            if ((out != 0) &&
+                (actuator_failsafe_active == 0U) &&
                 (actuator_valid[actuator] != 0U)) {
 
-                float pwm =
-                    actuator_value[actuator];
+                if (out->type == OUTPUT_PWM) {
 
-                if (pwm < 500.0F) {
-                    pwm = 500.0F;
+                    float pwm =
+                        actuator_value[actuator];
+
+                    if (pwm < 500.0F) {
+                        pwm = 500.0F;
+                    }
+
+                    if (pwm > 2500.0F) {
+                        pwm = 2500.0F;
+                    }
+
+                    pwm_us = (uint16_t)pwm;
+
+                } else if (out->type == OUTPUT_ON_OFF) {
+
+                    pwm_us =
+                        output_state_pwm(
+                            out,
+                            actuator_value[actuator] >= 1500.0F);
+
+                } else if (out->type == OUTPUT_PULSE) {
+
+                    pwm_us =
+                        (pulse_active[actuator] != 0U) ?
+                        out->on_pwm_us :
+                        out->off_pwm_us;
                 }
-
-                if (pwm > 2500.0F) {
-                    pwm = 2500.0F;
-                }
-
-                pwm_us = (uint16_t)pwm;
             }
 
             if (pca9685_set_pwm_us(
@@ -162,10 +294,15 @@ static void actuator_failsafe_process(void)
 {
     const uint32_t now = micros32();
 
+    const config_t *cfg = config_get();
+
+    const uint32_t failsafe_timeout_us =
+        (uint32_t)cfg->failsafe_timeout_ms * 1000U;
+
     const uint8_t timed_out =
         (have_actuator_command == 0U) ||
         ((uint32_t)(now - last_actuator_command_us) >=
-         ACTUATOR_FAILSAFE_US);
+         failsafe_timeout_us);
 
     if (timed_out == 0U) {
 
@@ -183,10 +320,13 @@ static void actuator_failsafe_process(void)
         return;
     }
 
-    for (uint8_t actuator = 0U;
-         actuator < ACTUATOR_COUNT;
-         actuator++) {
+    const uint8_t output_count =
+        config_get_output_count();
 
+    for (uint8_t actuator = 0U;
+         actuator < output_count;
+         actuator++) {
+     
         const uint8_t device =
             (uint8_t)(
                 actuator /
@@ -197,10 +337,42 @@ static void actuator_failsafe_process(void)
                 actuator %
                 PCA9685_CHANNELS_PER_DEVICE);
 
+        const output_config_t *out =
+            config_get_output(actuator);
+
+        if (out == 0) {
+            continue;
+        }
+
+        uint16_t safe_pwm_us;
+
+        if (out->type == OUTPUT_PWM) {
+
+            safe_pwm_us =
+                out->failsafe_pwm_us;
+
+        } else if ((out->type == OUTPUT_ON_OFF) ||
+                   (out->type == OUTPUT_PULSE)) {
+
+            safe_pwm_us =
+                output_state_pwm(
+                    out,
+                    out->failsafe_state);
+
+        } else {
+
+            /*
+             * DISABLED is not actively driven here.
+             */
+            pulse_reset(actuator);
+            actuator_valid[actuator] = 0U;
+            continue;
+        }
+
         if (pca9685_set_pwm_us(
                 device,
                 channel,
-                ACTUATOR_SAFE_PWM_US) < 0) {
+                safe_pwm_us) < 0) {
 
             pca_fault_active[device] = 1U;
 
@@ -209,13 +381,19 @@ static void actuator_failsafe_process(void)
         }
 
         /*
-         * Do not pretend that safe PWM came
-         * from DroneCAN.
+         * Do not pretend that the failsafe value
+         * came from DroneCAN.
          */
         actuator_valid[actuator] = 0U;
 
         actuator_value[actuator] =
-            (float)ACTUATOR_SAFE_PWM_US;
+            (float)safe_pwm_us;
+
+        /*
+         * Failsafe has absolute priority over
+         * any running or latched pulse.
+         */
+        pulse_reset(actuator);
     }
 
     actuator_failsafe_active = 1U;
@@ -349,6 +527,13 @@ static void on_transfer_received(CanardInstance *ins,
 {
     (void)ins;
 
+    if (param_server_handle(
+            &canard,
+            transfer)) {
+
+        return;
+    }    
+
     if ((transfer->transfer_type == CanardTransferTypeRequest) &&
         (transfer->data_type_id ==
          UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_ID)) {
@@ -394,6 +579,14 @@ static bool should_accept_transfer(const CanardInstance *ins,
       return true;
   }
 
+    if (param_server_should_accept(
+            out_data_type_signature,
+            data_type_id,
+            transfer_type)) {
+
+        return true;
+    }
+
     return false;
 }
 
@@ -420,39 +613,58 @@ static void handle_actuator_array_command(CanardRxTransfer *transfer)
         const struct uavcan_equipment_actuator_Command *cmd =
             &msg.commands.data[i];
 
+        const uint8_t output_count =
+            config_get_output_count();
+
         if ((cmd->actuator_id < 1U) ||
-            (cmd->actuator_id > ACTUATOR_COUNT)) {
+            (cmd->actuator_id > output_count)) {
             continue;
         }
-
-        uint8_t device;
-        uint8_t channel;
-
-        if (actuator_to_pca(
-            cmd->actuator_id,
-            &device,
-            &channel) < 0) {
-
-            continue;
-        }
+        
         const uint8_t actuator =
             (uint8_t)(cmd->actuator_id - 1U);
 
-        if (cmd->command_type ==
+        if (cmd->command_type !=
             UAVCAN_EQUIPMENT_ACTUATOR_COMMAND_COMMAND_TYPE_PWM) {
+            continue;
+        }
 
-            actuator_value[actuator] =
+        const output_config_t *out =
+            config_get_output(actuator);
+
+        if (out == 0) {
+            continue;
+        }
+
+        /*
+         * ArduPilot USE_ACTUATOR_PWM sends PWM command type
+         * for every configured output. OUTxx_TYPE defines
+         * how this node interprets the received PWM value.
+         */
+        const float input_pwm =
             cmd->command_value;
 
-            actuator_valid[actuator] = 1U;
+        actuator_value[actuator] =
+            input_pwm;
 
-            have_actuator_command = 1U;
-            last_actuator_command_us =
-                micros32();
+        actuator_valid[actuator] = 1U;
 
-            actuator_rx_count++;
+        have_actuator_command = 1U;
+        last_actuator_command_us =
+            micros32();
 
-            float pwm = cmd->command_value;
+        actuator_rx_count++;
+
+        if (out->type == OUTPUT_DISABLED) {
+
+            pulse_reset(actuator);
+            actuator_valid[actuator] = 0U;
+            continue;
+        }
+
+        if (out->type == OUTPUT_PWM) {
+
+            float pwm = input_pwm;
 
             if (pwm < 500.0F) {
                 pwm = 500.0F;
@@ -462,20 +674,80 @@ static void handle_actuator_array_command(CanardRxTransfer *transfer)
                 pwm = 2500.0F;
             }
 
-            const int pca_result =
-                pca9685_set_pwm_us(
-                    device,
-                    channel,
-                    (uint16_t)pwm);
+            (void)write_output_pwm(
+                actuator,
+                (uint16_t)pwm);
 
-            if (pca_result < 0) {
+            continue;
+        }
 
-                pca_fault_active[device] = 1U;
+        const uint8_t input_on =
+            (input_pwm >= 1500.0F) ?
+            1U :
+            0U;
 
-                status_set_flags(
-                    pca_status_flag(device));
+        if (out->type == OUTPUT_ON_OFF) {
 
+            (void)write_output_pwm(
+                actuator,
+                output_state_pwm(
+                    out,
+                    input_on));
+
+            continue;
+        }
+
+        if (out->type == OUTPUT_PULSE) {
+
+            const uint8_t old_input_on =
+                pulse_input_on[actuator];
+
+            pulse_input_on[actuator] =
+                input_on;
+
+            if (input_on == 0U) {
+
+                /*
+                 * OFF rearms RETRIG=IGNORE.
+                 * It does not abort an already running pulse;
+                 * the pulse still runs for OUTxx_TIME.
+                 */
+                pulse_wait_off[actuator] = 0U;
+                continue;
             }
+
+            if (pulse_active[actuator] != 0U) {
+
+                if (out->pulse_retrigger ==
+                    PULSE_RESTART) {
+
+                    pulse_started_us[actuator] =
+                        micros32();
+                }
+
+                continue;
+            }
+
+            if (pulse_wait_off[actuator] != 0U) {
+                continue;
+            }
+
+            /*
+             * New pulse requires OFF -> ON.
+             */
+            if (old_input_on != 0U) {
+                continue;
+            }
+
+            (void)write_output_pwm(
+                actuator,
+                out->on_pwm_us);
+
+            pulse_active[actuator] = 1U;
+            pulse_started_us[actuator] =
+                micros32();
+
+            continue;
         }
     }
 
@@ -496,16 +768,23 @@ void dronecan_actuator_init(void)
     const uint16_t flags =
         status_get_flags();
 
+    const config_t *cfg = config_get();
+
     pca_fault_active[0U] =
         ((flags & STATUS_FLAG_PCA0_ERROR) != 0U)
             ? 1U
             : 0U;
 
-    pca_fault_active[1U] =
-        ((flags & STATUS_FLAG_PCA1_ERROR) != 0U)
-            ? 1U
-            : 0U;
-
+    if (cfg->pca_count >= 2U) {
+        pca_fault_active[1U] =
+            ((flags & STATUS_FLAG_PCA1_ERROR) != 0U)
+                ? 1U
+                : 0U;
+    } else {
+        pca_fault_active[1U] = 0U;
+        status_clear_flags(STATUS_FLAG_PCA1_ERROR);
+    }
+    
     /*
      * No valid DroneCAN actuator command has
      * been received yet.
@@ -516,11 +795,21 @@ void dronecan_actuator_init(void)
      */
     have_actuator_command = 0U;
     actuator_failsafe_active = 0U;
+
+    for (uint8_t actuator = 0U;
+         actuator < ACTUATOR_COUNT;
+         actuator++) {
+
+        actuator_valid[actuator] = 0U;
+        actuator_value[actuator] = 0.0F;
+        pulse_reset(actuator);
+    }
 }
 
 void dronecan_actuator_process(void)
 {
     actuator_failsafe_process();
+    pulse_process();
     pca_recovery_process();
 }
 
@@ -534,8 +823,9 @@ void dronecan_init(void)
                should_accept_transfer,
                0);
 
-    canardSetLocalNodeID(&canard, DRONECAN_NODE_ID);
-
+    canardSetLocalNodeID(
+        &canard,
+        config_get()->node_id);
 }
 
 static void send_node_status(void)

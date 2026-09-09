@@ -49,25 +49,22 @@ STM32 является исполнительным CAN-узлом и обесп
 
 # Текущее состояние проекта
 
-На текущем этапе реализовано:
+Реализовано и проверено на реальном железе:
 
-- STM32F103C8T6;
-- системная частота 72 MHz;
-- встроенный bxCAN STM32;
-- CAN 500 kbit/s;
-- DroneCAN через `libcanard`;
-- `uavcan.protocol.NodeStatus`;
-- ответ на `uavcan.protocol.GetNodeInfo`;
-- приём `uavcan.equipment.actuator.ArrayCommand`;
-- поддержка actuator ID 1...16;
-- команды типа `PWM`;
-- PCA9685 через I2C1;
-- 16 PWM-выходов PCA9685;
-- частота PCA9685 50 Hz;
-- локальный actuator failsafe;
-- контроль ошибок I2C/PCA9685;
-- диагностический LED на PC13;
-- 64-битный uptime поверх TIM2.
+- STM32F103C8T6, 72 MHz;
+- bxCAN, DroneCAN через `libcanard`, CAN 500 kbit/s;
+- `NodeStatus`, `GetNodeInfo`, Parameter `GetSet` и `ExecuteOpcode`;
+- `uavcan.equipment.actuator.ArrayCommand`, входной тип `PWM`;
+- до 32 логических выходов через PCA9685 #0 `0x40` и #1 `0x41`;
+- `PCA_COUNT=1..2` (на текущем макете физически проверен PCA0);
+- I2C2 PB10/PB11, 100 kHz, восстановление I2C после ошибок;
+- SSD1306 128x32 `0x3C`;
+- режимы `DISABLED`, `PWM`, `ON_OFF`, `PULSE`;
+- PULSE `IGNORE` и `RESTART`;
+- локальный failsafe;
+- конфигурация во Flash с CRC32, явные SAVE/ERASE;
+- исправленный 16-битный TIM2 timebase;
+- аппаратные regression-тесты в `tests/`.
 
 ---
 
@@ -126,13 +123,13 @@ CAN-шина проекта ArduPilot работает на:
 
 # PCA9685
 
-PCA9685 подключается к I2C1 STM32.
+PCA9685 и OLED подключаются к I2C2 STM32.
 
 ```text
 STM32F103        PCA9685
 
-PB6  ---------> SCL
-PB7  <--------> SDA
+PB10 ---------> SCL
+PB11 <--------> SDA
 GND  ---------- GND
 ```
 
@@ -932,4 +929,4 @@ cd stm32_dronecan_pca9685
 
 make clean
 make
-```
+```\n\n---\n\n# Актуальная конфигурация выходов и параметры\n\nКаждый выход имеет тип:\n\n```text\n0 = DISABLED\n1 = PWM\n2 = ON_OFF\n3 = PULSE\n```\n\nДля `ON_OFF` и `PULSE` вход всё равно принимается как DroneCAN `COMMAND_TYPE_PWM`. Логический порог фиксирован: `<1500 us = OFF`, `>=1500 us = ON`.\n\nПараметры каждого активного выхода:\n\n```text\nOUT01_TYPE\nOUT01_ON\nOUT01_OFF\nOUT01_FS\nOUT01_FS_STATE\nOUT01_TIME\nOUT01_RETRIG\n```\n\nАналогично до `OUT32`. При `PCA_COUNT=1` публикуются OUT01..OUT16, при `PCA_COUNT=2` — OUT01..OUT32.\n\nДиапазоны и defaults:\n\n| Поле | Диапазон | Default |\n|---|---:|---:|\n| TYPE | 0..3 | 1 |\n| ON | 500..2500 us | 2000 |\n| OFF | 500..2500 us | 1000 |\n| FS | 500..2500 us | 1500 |\n| FS_STATE | 0..1 | 0 |\n| TIME | 1..60000 ms | 1000 |\n| RETRIG | 0..1 | 0 |\n\nСистемные параметры:\n\n```text\nNODE_ID       default 42\nCAN_BITRATE   default 500000\nPCA_COUNT     default 1\nFS_TIMEOUT    default 300 ms\n```\n\nВ аппаратных тестах текущая сохранённая конфигурация использовала `FS_TIMEOUT=700 ms`. Поддерживаемые значения CAN_BITRATE в конфигурации: 125000, 250000, 500000 и 1000000. Перед эксплуатационным изменением скорости необходимо проверить, что текущий CAN startup применяет сохранённый `CAN_BITRATE`.\n\n## PULSE\n\n`OUTxx_RETRIG=0` (`IGNORE`): OFF→ON запускает импульс. Повторные ON игнорируются; после завершения нужен OFF для re-arm.\n\n`OUTxx_RETRIG=1` (`RESTART`): каждый ON во время активного импульса перезапускает таймер. Непрерывный ON удерживает выход активным. Обычный OFF не обрывает уже запущенный импульс.\n\n## Failsafe\n\nДля PWM при failsafe используется `OUTxx_FS`. Для ON_OFF/PULSE используется `OUTxx_FS_STATE`: 0 выбирает `OUTxx_OFF`, 1 — `OUTxx_ON`. Failsafe имеет приоритет над PULSE и отменяет активный импульс.\n\nТекущий failsafe общий для узла: принятая actuator-команда обновляет общий таймер последней команды.\n\n# Flash configuration\n\nПоследняя 1 KB страница Flash STM32F103C8 зарезервирована по адресу:\n\n```text\n0x0800FC00\n```\n\nLinker script оставляет firmware 63 KB Flash. Конфигурация защищена magic/version/CRC32. Изменение параметров через `GetSet` работает в RAM и **не сохраняется автоматически**.\n\nСтандартный `uavcan.protocol.param.ExecuteOpcode`:\n\n```text\nSAVE  = 0\nERASE = 1\n```\n\nSAVE и восстановление после полного отключения питания проверены аппаратно. Текущая схема одно-страничная и не гарантирует power-fail-safe непосредственно во время erase/program; при необходимости можно перейти на двухстраничный journal.\n\n# OLED и LED\n\nSSD1306 128x32 имеет адрес `0x3C`. Экран показывает CAN/FS, состояние PCA0/PCA1, RX count и CAN diagnostics (TEC/REC/overflow/flags). При `PCA_COUNT=1` второй драйвер отображается как `P1 --`. Отказ OLED не должен останавливать PCA9685.\n\nДиагностические LED текущей платы:\n\n```text\nPB4  LED1 RUN\nPB3  LED2 FAILSAFE\nPA15 LED3 ERROR\n```\n\nОни active-high. JTAG отключается с сохранением SWD, чтобы освободить PB3/PB4; SWD остаётся на PA13/PA14.\n\n# Исправление TIM2\n\nTIM2 используется как 16-битный таймер 1 MHz с `ARR=0xFFFF`. Update IRQ увеличивает программную старшую часть счётчика; на этой основе реализованы `micros32()`/`micros64()`. Это устраняет прежнее переполнение каждые 65.536 ms, которое ломало failsafe и остальные интервалы.\n\n# Тесты\n\nАппаратные тесты находятся в `tests/`:\n\n```text\ntest_params.py\ntest_params_read_outputs.py\ntest_param_write_output.py\ntest_onoff.py\ntest_pulse.py\ntest_pulse_restart.py\ntest_failsafe_output.py\ntest_pulse_failsafe.py\n```\n\nПроверено на реальном железе:\n\n```text\n[OK] CAN 500 kbit/s\n[OK] NodeStatus / GetNodeInfo\n[OK] Parameter GetSet\n[OK] Parameter SAVE\n[OK] Flash restore after cold power cycle\n[OK] PCA_COUNT=1 / PCA0 0x40\n[OK] OLED 0x3C\n[OK] I2C2 PB10/PB11\n[OK] corrected TIM2 timebase\n[OK] PWM\n[OK] ON_OFF\n[OK] PULSE IGNORE\n[OK] PULSE RESTART\n[OK] ON_OFF failsafe FS_STATE=0/1\n[OK] PULSE interrupted by failsafe\n```\n\nВ тестах ON_OFF с 50 Hz PCA9685 измерено примерно `1000 us -> 0.16 V`, `2000 us -> 0.32 V`. PULSE IGNORE/RESTART и failsafe с `FS_TIMEOUT=700 ms` отработали согласно заданной логике.\n\nВторой физический PCA9685 (`0x41`, OUT17..OUT32) программно предусмотрен, но пока не отмечается как аппаратно проверенный.\n\n# SocketCAN для тестов\n\n```bash\nsudo ip link set can0 down\nsudo ip link set can0 type can bitrate 500000\nsudo ip link set can0 up\ncandump can0\n```\n\nДля используемого USB-CAN `restart-ms` не требуется и может не поддерживаться. В корне репозитория находится `can0.sh`.\n\n# Следующие проверки\n\n- физический PCA9685 #1 при `PCA_COUNT=2`;\n- применение сохранённого `CAN_BITRATE` при CAN startup;\n- recovery при ошибочно сохранённом Node ID/bitrate;\n- CAN BUS-OFF/recovery и длительный stress test;\n- интеграция всех требуемых выходов с ArduPilot Rover;\n- при необходимости двухстраничное power-fail-safe хранение конфигурации.\n

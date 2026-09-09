@@ -53,6 +53,15 @@ OBJECTS = \
 	$(BUILD_DIR)/pca9685.o \
 	$(BUILD_DIR)/status.o \
 	$(BUILD_DIR)/oled.o \
+	$(BUILD_DIR)/config.o \
+	$(BUILD_DIR)/param_server.o \
+	$(BUILD_DIR)/param_getset_req.o \
+	$(BUILD_DIR)/param_getset_res.o \
+	$(BUILD_DIR)/param_execute_req.o \
+	$(BUILD_DIR)/param_execute_res.o \
+	$(BUILD_DIR)/param_value.o \
+	$(BUILD_DIR)/param_numeric_value.o \
+	$(BUILD_DIR)/param_empty.o \
 	$(BUILD_DIR)/timebase.o	
 
 all: $(BUILD_DIR)/$(PROJECT).elf \
@@ -68,6 +77,33 @@ $(BUILD_DIR)/main.o: src/main.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/system.o: src/system.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_server.o: src/param_server.c src/param_server.h src/config.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_getset_req.o: dsdl_generated/src/uavcan.protocol.param.GetSet_req.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_getset_res.o: dsdl_generated/src/uavcan.protocol.param.GetSet_res.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_execute_req.o: dsdl_generated/src/uavcan.protocol.param.ExecuteOpcode_req.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_execute_res.o: dsdl_generated/src/uavcan.protocol.param.ExecuteOpcode_res.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_value.o: dsdl_generated/src/uavcan.protocol.param.Value.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_numeric_value.o: dsdl_generated/src/uavcan.protocol.param.NumericValue.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/param_empty.o: dsdl_generated/src/uavcan.protocol.param.Empty.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/config.o: src/config.c src/config.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/status.o: src/status.c src/status.h | $(BUILD_DIR)
