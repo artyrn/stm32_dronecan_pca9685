@@ -5,9 +5,16 @@ build/
 *~
 *.swp
 
+# OS
+.DS_Store
+
 # Python
+.venv/
 __pycache__/
 *.pyc
 
-# OS
-.DS_Store
+# Configurator local files
+dronecan_output_controller_configurator/.venv/
+
+# Local configurator saved configurations
+dronecan_output_controller_configurator/*.json

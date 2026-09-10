@@ -1,478 +1,587 @@
-# STM32 DroneCAN → PCA9685 Bridge
+# DroneCAN Output Controller
 
-Прошивка для STM32F103C8T6, которая принимает стандартные команды сервоприводов ArduPilot по DroneCAN и управляет 16-канальным PWM-драйвером PCA9685 по I2C.
+CAN-периферия для **ArduPilot Rover** на STM32F103C8T6 с выходами через
+PCA9685.
 
-Проект предназначен для использования как CAN-периферия ArduPilot Rover.
+Контроллер принимает стандартные DroneCAN-команды
+`uavcan.equipment.actuator.ArrayCommand` и преобразует их в локальные
+выходы `PWM`, `ON_OFF` и `PULSE`. Конфигурация выполняется через
+стандартный DroneCAN Parameter Protocol. Для настройки разработан
+отдельный графический **DroneCAN Output Controller Configurator**.
 
-## Архитектура
+Основная логика управления остаётся в ArduPilot/Lua. STM32 является
+исполнительным CAN-узлом и дополнительно обеспечивает локальный
+failsafe.
 
-```text
-ArduPilot Rover / Orange Pi H5
-        |
-        | DroneCAN
-        |
-      CAN bus
-        |
-     MCP2562
-        |
- STM32F103C8T6
-    Blue Pill
-        |
-        | I2C
-        |
-     PCA9685
-        |
-   16 PWM outputs
-```
-
-STM32 не выполняет основную логику управления ровером.
-
-Основная логика остаётся в ArduPilot:
-
-```text
-ArduPilot / Lua
+``` text
+ArduPilot Rover
       |
-      | servo outputs
+      | DroneCAN / ArrayCommand
       v
-DroneCAN ArrayCommand
+    CAN bus
       |
       v
-STM32F103
-      |
-      v
-PCA9685
-```
-
-STM32 является исполнительным CAN-узлом и обеспечивает дополнительный локальный failsafe.
-
----
-
-# Текущее состояние проекта
-
-Реализовано и проверено на реальном железе:
-
-- STM32F103C8T6, 72 MHz;
-- bxCAN, DroneCAN через `libcanard`, CAN 500 kbit/s;
-- `NodeStatus`, `GetNodeInfo`, Parameter `GetSet` и `ExecuteOpcode`;
-- `uavcan.equipment.actuator.ArrayCommand`, входной тип `PWM`;
-- до 32 логических выходов через PCA9685 #0 `0x40` и #1 `0x41`;
-- `PCA_COUNT=1..2` (на текущем макете физически проверен PCA0);
-- I2C2 PB10/PB11, 100 kHz, восстановление I2C после ошибок;
-- SSD1306 128x32 `0x3C`;
-- режимы `DISABLED`, `PWM`, `ON_OFF`, `PULSE`;
-- PULSE `IGNORE` и `RESTART`;
-- локальный failsafe;
-- конфигурация во Flash с CRC32, явные SAVE/ERASE;
-- исправленный 16-битный TIM2 timebase;
-- аппаратные regression-тесты в `tests/`.
-
----
-
-# Аппаратная часть
-
-## STM32
-
-Используется:
-
-```text
 STM32F103C8T6
-ARM Cortex-M3
-Blue Pill
+      |
+      | I2C2 PB10/PB11
+      +--------------------+
+      |                    |
+      v                    v
+PCA9685 #0             PCA9685 #1
+0x40                   0x41
+OUT01..OUT16           OUT17..OUT32
+      |
+      +---- SSD1306 128x32, 0x3C
 ```
 
-## CAN
+## Текущее состояние
 
-STM32F103 имеет встроенный CAN-контроллер bxCAN.
+На реальном контроллере проверены:
 
-Внешний MCP2515 для STM32 не требуется.
+-   STM32F103C8T6, 72 MHz;
+-   bxCAN + `libcanard`;
+-   CAN 500 kbit/s;
+-   `NodeStatus`;
+-   `GetNodeInfo`;
+-   `uavcan.protocol.param.GetSet`;
+-   `uavcan.protocol.param.ExecuteOpcode`;
+-   `uavcan.equipment.actuator.ArrayCommand`;
+-   до 32 логических выходов;
+-   PCA9685 #0 `0x40`;
+-   поддержка PCA9685 #1 `0x41`;
+-   `PCA_COUNT=1..2`;
+-   I2C2 PB10/PB11, 100 kHz;
+-   восстановление I2C после ошибок;
+-   OLED SSD1306 128x32 `0x3C`;
+-   режимы `DISABLED`, `PWM`, `ON_OFF`, `PULSE`;
+-   PULSE `IGNORE` и `RESTART`;
+-   индивидуальный failsafe выходов;
+-   конфигурация во Flash с CRC32;
+-   явные `SAVE` и `ERASE`;
+-   исправленный 16-битный TIM2 timebase;
+-   PySide6-конфигуратор;
+-   чтение/запись параметров из GUI;
+-   выборочная запись только изменённых параметров;
+-   сохранение/загрузка конфигурации в файл;
+-   индикация GUI → RAM и RAM → Flash;
+-   автоматическое чтение узла после `ERASE`;
+-   аппаратные regression-тесты.
 
-Необходим только CAN-трансивер, например:
+На текущем макете физически установлен и проверен один PCA9685.
+Поддержка второго PCA9685 реализована программно, физическая проверка
+будет выполнена на новой плате.
 
-```text
-MCP2562
+## Аппаратная часть
+
+### STM32F103C8T6
+
+Основные сигналы:
+
+``` text
+PA11  CAN_RX
+PA12  CAN_TX
+
+PB10  I2C2_SCL
+PB11  I2C2_SDA
+
+PA13  SWDIO
+PA14  SWCLK
+
+PB4   LED1 RUN
+PB3   LED2 FAILSAFE
+PA15  LED3 ERROR
 ```
 
-Подключение:
+JTAG отключается, SWD остаётся доступным.
 
-```text
-STM32F103           MCP2562
+### CAN
 
-PA12 CAN_TX   --->  TXD
-PA11 CAN_RX   <---  RXD
+Используется встроенный bxCAN STM32F103 и внешний CAN-трансивер
+MCP2562/MCP2562FD.
 
-                    CANH ---> CANH шины
-                    CANL ---> CANL шины
+``` text
+STM32              MCP2562FD
 
-GND           ----- GND
+PA12 CAN_TX  ----> TXD
+PA11 CAN_RX  <---- RXD
+
+3.3 V        ----> VIO
+5 V          ----> VDD
+GND          ----- GND
 ```
 
-Для MCP2562 с выводом VIO:
+`STBY` трансивера должен иметь определённое состояние. Для постоянной
+работы CAN его необходимо удерживать в LOW.
 
-```text
-VDD = 5 V
-VIO = 3.3 V
-```
+Номинальная скорость CAN:
 
-CAN-шина проекта ArduPilot работает на:
-
-```text
+``` text
 500000 bit/s
 ```
 
----
+Терминатор 120 Ом устанавливается только на физическом конце CAN-шины.
 
-# PCA9685
+## I2C2
 
-PCA9685 и OLED подключаются к I2C2 STM32.
+PCA9685 и OLED работают на одном I2C2:
 
-```text
-STM32F103        PCA9685
-
-PB10 ---------> SCL
-PB11 <--------> SDA
-GND  ---------- GND
+``` text
+PB10 = SCL
+PB11 = SDA
 ```
 
-Используется адрес:
+Скорость:
 
-```text
-0x40
-```
-
-I2C работает на:
-
-```text
+``` text
 100 kHz
 ```
 
-SDA и SCL должны иметь pull-up резисторы к 3.3 V.
+Адреса:
 
-Типичное значение:
-
-```text
-4.7 kOhm
+``` text
+0x40  PCA9685 #0
+0x41  PCA9685 #1
+0x3C  SSD1306 128x32
 ```
 
-Необходимо проверить конкретный модуль PCA9685: некоторые платы уже содержат pull-up резисторы.
+Прошивка содержит восстановление I2C: освобождение линий, импульсы SCL и
+повторную инициализацию после ошибок шины.
 
-Логическое питание PCA9685 рекомендуется делать 3.3 V.
+## Выходы
 
-Питание сервоприводов/ESC через вывод `V+` PCA9685 является отдельным от логического питания.
+Соответствие DroneCAN actuator ID:
 
----
-
-# Соответствие DroneCAN каналов PCA9685
-
-```text
-actuator_id 1  -> PCA9685 CH0
-actuator_id 2  -> PCA9685 CH1
-actuator_id 3  -> PCA9685 CH2
+``` text
+actuator_id  1 -> PCA0 CH0
 ...
-actuator_id 16 -> PCA9685 CH15
+actuator_id 16 -> PCA0 CH15
+
+actuator_id 17 -> PCA1 CH0
+...
+actuator_id 32 -> PCA1 CH15
 ```
 
-Принимается стандартное сообщение:
+Количество доступных выходов определяется параметром `PCA_COUNT`.
 
-```text
-uavcan.equipment.actuator.ArrayCommand
+### Типы выходов
+
+``` text
+0 = DISABLED
+1 = PWM
+2 = ON_OFF
+3 = PULSE
 ```
 
-Прошивка обрабатывает команды:
+Для каждого выхода имеются параметры:
 
-```text
-COMMAND_TYPE_PWM
+``` text
+OUT01_TYPE
+OUT01_ON
+OUT01_OFF
+OUT01_FS
+OUT01_FS_STATE
+OUT01_TIME
+OUT01_RETRIG
 ```
 
-Значение `command_value` рассматривается как PWM в микросекундах.
+Аналогично для `OUT02` ... `OUT32`.
 
-Например:
+### PWM
 
-```text
-1000 us
-1500 us
-2000 us
-```
+Входной DroneCAN command type для всех активных типов выхода --- `PWM`.
 
----
+Диапазон:
 
-# PWM PCA9685
-
-Частота:
-
-```text
-50 Hz
-```
-
-Период:
-
-```text
-20000 us
-```
-
-Преобразование PWM в значение счётчика PCA9685:
-
-```text
-count = pulse_us * 4096 / 20000
-```
-
-Примерные значения:
-
-```text
-1000 us -> 205
-1500 us -> 307
-2000 us -> 410
-```
-
-В текущей версии входной PWM ограничивается диапазоном:
-
-```text
+``` text
 500 ... 2500 us
 ```
 
----
+PCA9685 работает на 50 Hz.
 
-# Локальный failsafe
+Для `PWM` значение DroneCAN передаётся непосредственно как ширина
+импульса.
 
-STM32 самостоятельно контролирует поступление actuator-команд.
+### ON_OFF
 
-Если валидные DroneCAN PWM-команды отсутствуют примерно:
+Логическое состояние определяется входным PWM:
 
-```text
+``` text
+PWM < 1500 us   -> OFF
+PWM >= 1500 us  -> ON
+```
+
+Физические значения задаются:
+
+``` text
+OUTxx_OFF
+OUTxx_ON
+```
+
+### PULSE
+
+Переход `OFF -> ON` запускает импульс длительностью:
+
+``` text
+OUTxx_TIME
+```
+
+Режим:
+
+``` text
+OUTxx_RETRIG = 0  IGNORE
+OUTxx_RETRIG = 1  RESTART
+```
+
+`IGNORE` не позволяет повторным ON продлевать импульс. После завершения
+требуется получить OFF перед новым запуском.
+
+`RESTART` перезапускает таймер при повторных ON во время активного
+импульса.
+
+## Failsafe
+
+Глобальный таймаут:
+
+``` text
+FS_TIMEOUT
+```
+
+Значение по умолчанию:
+
+``` text
 300 ms
 ```
 
-активируется локальный failsafe.
+Для `PWM` при failsafe используется:
 
-В текущей версии безопасное значение:
-
-```text
-1500 us
+``` text
+OUTxx_FS
 ```
 
-устанавливается для выходов PCA9685.
+Для `ON_OFF` и `PULSE`:
 
-В дальнейшем безопасные значения можно сделать индивидуальными для каждого из 16 каналов.
-
-Локальный failsafe работает независимо от failsafe ArduPilot.
-
-Таким образом:
-
-```text
-ArduPilot failsafe
-       +
-STM32 local failsafe
+``` text
+OUTxx_FS_STATE
 ```
 
-образуют два уровня защиты.
+где `0` выбирает `OUTxx_OFF`, а `1` --- `OUTxx_ON`.
 
----
+Failsafe имеет приоритет над PULSE и немедленно отменяет активный pulse
+timer.
 
-# LED-индикация
+## Системные DroneCAN-параметры
 
-Используется штатный LED Blue Pill:
-
-```text
-PC13
+``` text
+NODE_ID
+CAN_BITRATE
+PCA_COUNT
+FS_TIMEOUT
 ```
 
-LED active-low.
+Текущие значения по умолчанию:
 
-Текущая индикация:
-
-```text
-короткая вспышка раз в секунду
-    NORMAL
-
-2 вспышки
-    PCA9685 / I2C ERROR
-
-3 вспышки
-    CAN INIT ERROR
-
-быстрое мигание ~5 Hz
-    ACTUATOR FAILSAFE
-
-постоянно горит
-    FATAL ERROR
+``` text
+NODE_ID      = 42
+CAN_BITRATE  = 500000
+PCA_COUNT    = 1
+FS_TIMEOUT   = 300 ms
 ```
 
-Индикация предназначена не только для разработки, но и для диагностики узла непосредственно на ровере.
+Поддерживаемые значения `CAN_BITRATE` в конфигурации:
 
----
-
-# Структура репозитория
-
-```text
-stm32_dronecan_pca9685/
-├── .gitmodules
-├── .gitignore
-├── Makefile
-├── STM32F103C8T6.ld
-│
-├── src/
-│   ├── main.c
-│   ├── startup_stm32f103.s
-│   ├── system.c
-│   ├── timebase.c
-│   ├── minilibc.c
-│   ├── platform.c
-│   ├── can_hw.c
-│   ├── dronecan.c
-│   ├── i2c.c
-│   ├── pca9685.c
-│   ├── status.c
-│   └── status.h
-│
-├── dsdl_generated/
-│
-├── libcanard/
-├── DSDL/
-└── dronecan_dsdlc/
+``` text
+125000
+250000
+500000
+1000000
 ```
 
----
+**Важно:** параметр `CAN_BITRATE` в конфигурации ещё необходимо
+окончательно проверить на предмет применения при запуске CAN. До этой
+проверки рабочей скоростью проекта считается 500 kbit/s.
 
-# Внешние зависимости Git
+## Flash-конфигурация
 
-Три внешних проекта подключены как Git submodules:
+Конфигурация хранится в последней странице Flash STM32F103C8T6:
 
-```text
-libcanard
-DSDL
-dronecan_dsdlc
+``` text
+0x0800FC00
 ```
 
-На момент создания первой рабочей версии использовались:
+Используются:
 
-```text
-DSDL
-b4653c7abc3c47cb31b16efa24ea755232774756
+-   magic;
+-   version;
+-   CRC32;
+-   проверка диапазонов параметров.
 
-dronecan_dsdlc
-431170fa4bfe2212b516b8f33bdc796267907f1c
+Запись выполняется только по явной команде:
 
-libcanard
-601ed35467e0ac38819df17cd7c918de19f62d58
+``` text
+SAVE Flash
 ```
 
-Git автоматически сохраняет эти конкретные ревизии в основном репозитории.
+`ERASE Flash` удаляет сохранённую конфигурацию. При отсутствии валидной
+Flash-конфигурации прошивка использует значения по умолчанию.
 
----
+Сохранение во Flash и восстановление после многократных холодных
+перезапусков проверены на реальном устройстве.
 
-# Как забрать проект на другой компьютер
+## OLED
 
-Рекомендуемый способ:
+SSD1306 128x32 показывает состояние узла.
 
-```bash
-git clone --recurse-submodules \
-    https://github.com/artyrn/stm32_dronecan_pca9685.git
+Пример:
+
+``` text
+CAN OK FS ON
+P0 OK P1 --
+RX 0 E 0
+T0 R0 O0 F8
 ```
 
-После этого:
+Где:
 
-```bash
-cd stm32_dronecan_pca9685
+``` text
+CAN      состояние CAN
+FS       состояние failsafe
+P0/P1    состояние PCA9685
+RX       принятые actuator-команды
+E        ошибки canardSTM32
+T        TEC
+R        REC
+O        RX overflow
+F        status flags
 ```
 
-Проверить submodules:
+При `PCA_COUNT=1` второй PCA отображается как:
 
-```bash
-git submodule status
+``` text
+P1 --
 ```
 
-Должны присутствовать:
+## LED
 
-```text
-DSDL
-dronecan_dsdlc
-libcanard
+На проектной плате:
+
+``` text
+PB4   RUN
+PB3   FAILSAFE
+PA15  ERROR
 ```
 
----
+RUN использует исправленный TIM2 timebase и даёт короткую индикацию
+примерно раз в секунду.
 
-# Если проект уже был клонирован без submodules
+## TIM2
 
-Если был выполнен обычный:
+TIM2 у STM32F103C8T6 в данной реализации используется как 16-битный
+таймер 1 MHz.
 
-```bash
-git clone https://github.com/artyrn/stm32_dronecan_pca9685.git
+Переполнение происходит каждые:
+
+``` text
+65.536 ms
 ```
 
-то зависимости можно получить позже:
+Для формирования непрерывного времени реализован `TIM2_IRQHandler`,
+программная старшая часть счётчика и функции `micros32()` /
+`micros64()`.
 
-```bash
-cd stm32_dronecan_pca9685
+Это исправление критично для failsafe, PULSE, NodeStatus и периодических
+задач.
 
-git submodule update --init --recursive
+# DroneCAN Output Controller Configurator
+
+GUI находится в:
+
+``` text
+dronecan_output_controller_configurator/
+```
+
+Текущая стабильная версия на момент этого README:
+
+``` text
+rev23
+```
+
+Используются:
+
+``` text
+Python 3
+PySide6
+dronecan
+SocketCAN
+```
+
+## Установка GUI
+
+Из каталога конфигуратора:
+
+``` bash
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
 Проверка:
 
-```bash
-git submodule status
+``` bash
+python -c "import PySide6, dronecan; print(PySide6.__version__)"
 ```
 
----
+## Запуск
 
-# Обновление существующей копии проекта
+Сначала поднять SocketCAN:
 
-Получить изменения основного репозитория:
-
-```bash
-git pull
+``` bash
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 up
 ```
 
-После `git pull` желательно выполнить:
+Проверить:
 
-```bash
+``` bash
+ip -details -statistics link show can0
+```
+
+Затем:
+
+``` bash
+cd dronecan_output_controller_configurator
+source .venv/bin/activate
+python dronecan_output_controller_configurator_rev_23.py
+```
+
+## Возможности GUI rev23
+
+Конфигуратор умеет:
+
+-   подключаться к `can0`;
+-   работать с заданным Node ID;
+-   читать параметры узла;
+-   изменять системные параметры;
+-   изменять OUT01...OUT32;
+-   автоматически отключать неприменимые поля в зависимости от `TYPE`;
+-   учитывать `PCA_COUNT`;
+-   записывать только реально изменённые параметры;
+-   повторять DroneCAN-запрос при временном timeout;
+-   выполнять `SAVE Flash`;
+-   выполнять `ERASE Flash`;
+-   автоматически перечитывать узел через 500 ms после успешного
+    `ERASE`;
+-   сохранять конфигурацию в JSON;
+-   загружать конфигурацию из JSON;
+-   запоминать положение/размер окна;
+-   запоминать светлую/тёмную тему;
+-   показывать подробные tooltips с задержкой 600 ms.
+
+### Маркеры изменений
+
+``` text
+●  изменено в GUI, но ещё не записано в RAM
+
+◆  эта GUI-сессия успешно записала параметр в RAM,
+   но после этого ещё не выполнялся SAVE Flash
+```
+
+GUI не пытается угадывать содержимое Flash после обычного чтения узла.
+
+`Прочитать узел` отображает фактическую конфигурацию, которую вернул
+контроллер.
+
+После `ERASE` старые `◆` удаляются и автоматически выполняется новое
+чтение узла.
+
+### Безопасная схема работы
+
+``` text
+Прочитать узел
+      |
+      v
+изменить параметры
+      |
+      | ●
+      v
+Записать в узел
+      |
+      | ◆
+      v
+проверить работу
+      |
+      v
+SAVE Flash
+```
+
+Это позволяет сначала проверить конфигурацию в RAM и только затем
+сделать её постоянной.
+
+## Горячие клавиши GUI
+
+``` text
+Ctrl+Shift+C   открыть соединение
+Ctrl+O         открыть файл
+Ctrl+S         сохранить файл
+Ctrl+Q         выход
+
+F5             прочитать узел
+F6             записать в узел
+Ctrl+Shift+S   SAVE Flash
+F1             помощь
+```
+
+# Аппаратные тесты
+
+В `tests/` находятся вспомогательные тесты, использовавшиеся при
+разработке:
+
+``` text
+test_onoff.py
+test_pulse.py
+test_pulse_restart.py
+test_failsafe_output.py
+test_pulse_failsafe.py
+test_param_write_output.py
+test_params.py
+test_params_read_outputs.py
+```
+
+На реальном PCA9685 подтверждены:
+
+-   PWM;
+-   ON_OFF;
+-   PULSE IGNORE;
+-   PULSE RESTART;
+-   ON_OFF failsafe state 0/1;
+-   прерывание PULSE при failsafe;
+-   запись параметров в RAM;
+-   SAVE Flash;
+-   восстановление после холодного старта;
+-   ERASE и переход к defaults.
+
+# Сборка прошивки
+
+Клонирование:
+
+``` bash
+git clone --recurse-submodules \
+    https://github.com/artyrn/stm32_dronecan_pca9685.git
+
+cd stm32_dronecan_pca9685
+```
+
+Если submodules не были загружены:
+
+``` bash
 git submodule update --init --recursive
 ```
 
-Это гарантирует, что `libcanard`, `DSDL` и `dronecan_dsdlc` переключены именно на те версии, которые указаны текущим коммитом проекта.
+Установка toolchain на Ubuntu/Debian:
 
----
-
-# Что необходимо установить для компиляции
-
-Проект собирается обычным GNU ARM Embedded toolchain.
-
-Не требуется:
-
-- Arduino;
-- PlatformIO;
-- STM32CubeIDE;
-- HAL STM32Cube;
-- операционная система на STM32.
-
-Используется bare-metal код и драйвер bxCAN из libcanard.
-
-Основные необходимые программы:
-
-```text
-git
-make
-python3
-arm-none-eabi-gcc
-arm-none-eabi-objcopy
-arm-none-eabi-size
-```
-
-Для прошивки позже потребуется:
-
-```text
-OpenOCD
-ST-Link V2
-```
-
----
-
-# Ubuntu / Debian
-
-Установить базовые инструменты:
-
-```bash
+``` bash
 sudo apt update
-
 sudo apt install \
     git \
     make \
@@ -482,451 +591,194 @@ sudo apt install \
     openocd
 ```
 
-Проверить компилятор:
+Сборка:
 
-```bash
-arm-none-eabi-gcc --version
-```
-
-Проверить Make:
-
-```bash
-make --version
-```
-
-Проверить Python:
-
-```bash
-python3 --version
-```
-
----
-
-# Используемый компилятор
-
-Разработка первоначально выполнялась с:
-
-```text
-arm-none-eabi-gcc 10.2.1
-```
-
-из GNU Arm Embedded Toolchain:
-
-```text
-gcc-arm-none-eabi-10-2020-q4-major
-```
-
-Более новые версии `arm-none-eabi-gcc` также должны собирать проект, но желательно проверять предупреждения и размер прошивки.
-
-В проекте включены:
-
-```text
--Wall
--Wextra
--Werror
-```
-
-Поэтому предупреждения компилятора считаются ошибками.
-
----
-
-# Почему используется -nostdlib
-
-Прошивка собирается без стандартной runtime-среды libc:
-
-```text
--nostartfiles
--nostdlib
-```
-
-Минимально необходимые функции реализованы внутри проекта.
-
-Например:
-
-```text
-memset()
-memcpy()
-usleep()
-```
-
-Однако `libcanard` использует операции с `float`, поэтому при линковке подключается:
-
-```text
--lgcc
-```
-
-`libgcc` предоставляет программные ARM runtime-функции, например:
-
-```text
-__aeabi_fmul
-__aeabi_fcmpge
-```
-
----
-
-# Генерация DroneCAN DSDL
-
-Сгенерированные файлы уже находятся в:
-
-```text
-dsdl_generated/
-```
-
-Поэтому для обычной сборки повторная генерация не требуется.
-
-Если DSDL были изменены или требуется пересоздать generated-код:
-
-```bash
-python3 dronecan_dsdlc/dronecan_dsdlc.py \
-    -O dsdl_generated \
-    DSDL/uavcan \
-    DSDL/dronecan \
-    DSDL/com \
-    DSDL/ardupilot
-```
-
-После этого должны появиться, среди прочих:
-
-```text
-dsdl_generated/include/uavcan.protocol.NodeStatus.h
-dsdl_generated/include/uavcan.protocol.GetNodeInfo_res.h
-dsdl_generated/include/uavcan.equipment.actuator.ArrayCommand.h
-```
-
-и соответствующие `.c` файлы в:
-
-```text
-dsdl_generated/src/
-```
-
----
-
-# Сборка
-
-Из корня проекта:
-
-```bash
-make
-```
-
-Для полной пересборки:
-
-```bash
+``` bash
 make clean
 make
 ```
 
-После успешной сборки создаются:
+Результаты:
 
-```text
+``` text
 build/stm32_dronecan_pca9685.elf
 build/stm32_dronecan_pca9685.bin
+build/stm32_dronecan_pca9685.hex
 build/stm32_dronecan_pca9685.map
 ```
 
-Проверить размер:
+Последняя подтверждённая сборка после реализации логических выходов:
 
-```bash
-arm-none-eabi-size build/stm32_dronecan_pca9685.elf
+``` text
+text 16936
+data     0
+bss   3800
+dec  20736
+hex   5100
 ```
 
-На текущем этапе размер прошивки примерно:
-
-```text
-text    8912
-data       0
-bss     1124
-```
-
-STM32F103C8T6 имеет:
-
-```text
-FLASH 64 KB
-RAM   20 KB
-```
-
-поэтому запас памяти остаётся большим.
-
----
-
-# Тактирование STM32
-
-Используется внешний кварц:
-
-```text
-HSE = 8 MHz
-```
-
-PLL:
-
-```text
-8 MHz x 9 = 72 MHz
-```
-
-Итоговые частоты:
-
-```text
-SYSCLK = 72 MHz
-AHB    = 72 MHz
-APB2   = 72 MHz
-APB1   = 36 MHz
-```
-
-bxCAN работает от APB1:
-
-```text
-CAN clock = 36 MHz
-```
-
-TIM2 получает:
-
-```text
-72 MHz
-```
-
-и настроен на счёт:
-
-```text
-1 MHz
-```
-
-то есть:
-
-```text
-1 count = 1 us
-```
-
----
-
-# DroneCAN Node ID
-
-На текущем этапе node ID задан в прошивке:
-
-```text
-42
-```
-
-Узел периодически отправляет:
-
-```text
-uavcan.protocol.NodeStatus
-```
-
-и отвечает на:
-
-```text
-uavcan.protocol.GetNodeInfo
-```
-
-Имя узла:
-
-```text
-com.artyrn.pca9685
-```
-
----
-
-# STM32 Unique ID
-
-В `GetNodeInfo` используется заводской 96-битный Unique Device ID STM32F103.
-
-Адрес UID STM32F103:
-
-```text
-0x1FFFF7E8
-```
-
-Он используется для формирования уникального hardware ID DroneCAN-узла.
-
----
-
-# Настройка ArduPilot
-
-На стороне ArduPilot должен быть включён DroneCAN.
-
-Основная схема:
-
-```text
-CAN_P1_DRIVER = 1
-CAN_D1_PROTOCOL = 1
-```
-
-Также необходимо разрешить передачу servo outputs через DroneCAN.
-
-Прошивка STM32 ожидает именно:
-
-```text
-uavcan.equipment.actuator.ArrayCommand
-```
-
-с командами:
-
-```text
-COMMAND_TYPE_PWM
-```
-
-То есть ArduPilot должен быть настроен на передачу actuator-команд в режиме PWM, а не UNIT_LESS.
-
-Конкретные параметры ArduPilot и bitmask каналов необходимо настраивать под конкретную конфигурацию Rover.
-
----
-
-# Соответствие каналов ArduPilot
-
-Пример:
-
-```text
-Servo output 1  -> DroneCAN actuator_id 1  -> PCA9685 CH0
-Servo output 2  -> DroneCAN actuator_id 2  -> PCA9685 CH1
-Servo output 3  -> DroneCAN actuator_id 3  -> PCA9685 CH2
-...
-Servo output 16 -> DroneCAN actuator_id 16 -> PCA9685 CH15
-```
-
-DroneCAN `ArrayCommand` содержит максимум 15 actuator-команд в одном сообщении.
-
-Поэтому 16-й выход может передаваться отдельным сообщением.
-
-Прошивка STM32 обрабатывает каждый `actuator_id` независимо.
-
----
-
-# Прошивка через ST-Link
-
-После появления ST-Link V2 прошивку можно будет выполнять через SWD.
-
-Типичное подключение:
-
-```text
-ST-Link          STM32F103
-
-SWDIO   -------> PA13 / SWDIO
-SWCLK   -------> PA14 / SWCLK
-GND     -------- GND
-3.3V    -------- 3.3V reference
-```
+# Прошивка ST-Link
 
 Пример OpenOCD:
 
-```bash
+``` bash
 openocd \
     -f interface/stlink.cfg \
     -f target/stm32f1x.cfg \
     -c "program build/stm32_dronecan_pca9685.elf verify reset exit"
 ```
 
-После появления реального ST-Link команда будет проверена на используемом адаптере.
+# ArduPilot
 
----
+Контроллер предназначен для работы как DroneCAN-периферия ArduPilot
+Rover.
 
-# Git workflow
+ArduPilot должен передавать actuator commands как PWM в микросекундах.
+Для этого используется режим DroneCAN actuator PWM (`USE_ACTUATOR_PWM`).
 
-Текущая основная ветка:
+Окончательные параметры ArduPilot следует фиксировать после проверки на
+используемой версии ArduPilot Rover, поскольку имена/опции параметров
+могут меняться между версиями.
 
-```text
-main
+# TODO
+
+## Конфигуратор
+
+### Поиск контроллера при неизвестном Node ID
+
+Добавить кнопку поиска узла без необходимости заранее знать Node ID.
+
+Предпочтительный способ --- пассивно слушать
+`uavcan.protocol.NodeStatus`, а не перебирать Node ID 1...125 запросами
+параметров.
+
+После обнаружения узла:
+
+``` text
+найденный Node ID
+      |
+      v
+выбор пользователем
+      |
+      v
+автоматическое заполнение Node ID
+      |
+      v
+Прочитать узел
 ```
 
-Первый рабочий коммит:
+### Вкладка CAN-сеть
 
-```text
-04c7998 Initial DroneCAN PCA9685 STM32 bridge
+Добавить сканирование активных DroneCAN-узлов.
+
+Предполагаемая таблица:
+
+``` text
+Node ID | Name | Status | Uptime | Health | Mode | Last seen
 ```
 
-Проверить состояние:
+Нужно:
 
-```bash
-git status
+-   пассивно собирать `NodeStatus`;
+-   получать `GetNodeInfo` для найденных узлов;
+-   показывать активные Node ID;
+-   позволить выбрать найденный DroneCAN Output Controller;
+-   диагностировать возможные проблемы с Node ID.
+
+### Вкладка Тесты
+
+Добавить безопасное ручное тестирование выходов без изменения
+конфигурационных параметров.
+
+Для `PWM`:
+
+``` text
+ручная установка PWM 500...2500 us
 ```
 
-Проверить submodules:
+Для `ON_OFF`:
 
-```bash
-git submodule status
+``` text
+OFF
+ON
 ```
 
-Добавить изменения:
+Для `PULSE`:
 
-```bash
-git add .
+``` text
+Trigger
 ```
 
-Создать коммит:
+Нужно учитывать:
 
-```bash
-git commit -m "Описание изменений"
+-   текущий `TYPE`;
+-   `PCA_COUNT`;
+-   только реально доступные OUT;
+-   безопасное завершение тестового режима;
+-   кнопку `Все в безопасное состояние`;
+-   тестовые команды не должны автоматически сохранять или изменять
+    конфигурацию.
+
+### CAN diagnostics
+
+Добавить отображение:
+
+-   состояния `can0`;
+-   bitrate;
+-   RX/TX;
+-   найденных DroneCAN nodes;
+-   доступной через SocketCAN статистики ошибок.
+
+## CAN stress test
+
+Перед окончательной интеграцией на Rover:
+
+-   проверить STM32 на загруженной CAN 500 kbit/s;
+-   создать фоновый трафик через `cangen`;
+-   измерять загрузку через `canbusload`;
+-   проверить примерно 20 / 40 / 60 / 80 % bus load;
+-   одновременно передавать DroneCAN actuator commands;
+-   одновременно читать/писать параметры;
+-   контролировать OLED: CAN, E, TEC, REC, RX overflow;
+-   `RX overflow` должен оставаться `0`;
+-   проверить failsafe под нагрузкой;
+-   после теста решить, нужны ли bxCAN acceptance filters.
+
+## Второй PCA9685
+
+После получения новой платы:
+
+-   физически установить PCA9685 #1 `0x41`;
+-   установить `PCA_COUNT=2`;
+-   проверить OUT17...OUT32;
+-   проверить одновременную работу двух PCA;
+-   проверить recovery каждого PCA независимо;
+-   проверить failsafe на всех 32 выходах.
+
+## CAN bitrate
+
+Проверить и при необходимости связать `CAN_BITRATE` из
+Flash-конфигурации с реальной инициализацией bxCAN.
+
+Нужен безопасный механизм восстановления, если пользователь сохранит
+неправильный bitrate или Node ID и потеряет связь с узлом.
+
+# Принцип проекта
+
+Контроллер должен оставаться простым исполнительным CAN-устройством:
+
+``` text
+ArduPilot / Lua
+    = логика управления
+
+DroneCAN
+    = транспорт
+
+STM32
+    = исполнитель + локальная защита
+
+PCA9685
+    = физические выходы
 ```
 
-Отправить на GitHub:
-
-```bash
-git push
-```
-
----
-
-# Важное замечание о submodules
-
-Не следует вручную заменять содержимое:
-
-```text
-libcanard/
-DSDL/
-dronecan_dsdlc/
-```
-
-если изменение этих зависимостей не является осознанным.
-
-Основной Git-репозиторий хранит конкретный commit каждого submodule.
-
-Если submodule был случайно переключён:
-
-```bash
-git submodule update --init --recursive
-```
-
-вернёт его к версии, сохранённой в основном проекте.
-
----
-
-# План дальнейшей разработки
-
-Следующие этапы:
-
-- автоматическое восстановление PCA9685 после runtime I2C error;
-- улучшение приоритетов диагностических состояний;
-- передача состояния failsafe и ошибок через DroneCAN NodeStatus;
-- индивидуальные safe PWM для 16 каналов;
-- аппаратная проверка STM32F103 + MCP2562;
-- аппаратная проверка PCA9685;
-- тест DroneCAN с ArduPilot Rover;
-- тест потери CAN;
-- тест отключения PCA9685;
-- тест длительной работы;
-- проверка CAN BUS-OFF и восстановления;
-- параметризация node ID и других настроек;
-- проверка работы с реальными ESC и исполнительными устройствами Rover.
-
----
-
-# Репозиторий
-
-```text
-https://github.com/artyrn/stm32_dronecan_pca9685
-```
-
-Для полного клонирования вместе со всеми зависимостями:
-
-```bash
-git clone --recurse-submodules \
-    https://github.com/artyrn/stm32_dronecan_pca9685.git
-```
-
-После клонирования:
-
-```bash
-cd stm32_dronecan_pca9685
-
-make clean
-make
-```\n\n---\n\n# Актуальная конфигурация выходов и параметры\n\nКаждый выход имеет тип:\n\n```text\n0 = DISABLED\n1 = PWM\n2 = ON_OFF\n3 = PULSE\n```\n\nДля `ON_OFF` и `PULSE` вход всё равно принимается как DroneCAN `COMMAND_TYPE_PWM`. Логический порог фиксирован: `<1500 us = OFF`, `>=1500 us = ON`.\n\nПараметры каждого активного выхода:\n\n```text\nOUT01_TYPE\nOUT01_ON\nOUT01_OFF\nOUT01_FS\nOUT01_FS_STATE\nOUT01_TIME\nOUT01_RETRIG\n```\n\nАналогично до `OUT32`. При `PCA_COUNT=1` публикуются OUT01..OUT16, при `PCA_COUNT=2` — OUT01..OUT32.\n\nДиапазоны и defaults:\n\n| Поле | Диапазон | Default |\n|---|---:|---:|\n| TYPE | 0..3 | 1 |\n| ON | 500..2500 us | 2000 |\n| OFF | 500..2500 us | 1000 |\n| FS | 500..2500 us | 1500 |\n| FS_STATE | 0..1 | 0 |\n| TIME | 1..60000 ms | 1000 |\n| RETRIG | 0..1 | 0 |\n\nСистемные параметры:\n\n```text\nNODE_ID       default 42\nCAN_BITRATE   default 500000\nPCA_COUNT     default 1\nFS_TIMEOUT    default 300 ms\n```\n\nВ аппаратных тестах текущая сохранённая конфигурация использовала `FS_TIMEOUT=700 ms`. Поддерживаемые значения CAN_BITRATE в конфигурации: 125000, 250000, 500000 и 1000000. Перед эксплуатационным изменением скорости необходимо проверить, что текущий CAN startup применяет сохранённый `CAN_BITRATE`.\n\n## PULSE\n\n`OUTxx_RETRIG=0` (`IGNORE`): OFF→ON запускает импульс. Повторные ON игнорируются; после завершения нужен OFF для re-arm.\n\n`OUTxx_RETRIG=1` (`RESTART`): каждый ON во время активного импульса перезапускает таймер. Непрерывный ON удерживает выход активным. Обычный OFF не обрывает уже запущенный импульс.\n\n## Failsafe\n\nДля PWM при failsafe используется `OUTxx_FS`. Для ON_OFF/PULSE используется `OUTxx_FS_STATE`: 0 выбирает `OUTxx_OFF`, 1 — `OUTxx_ON`. Failsafe имеет приоритет над PULSE и отменяет активный импульс.\n\nТекущий failsafe общий для узла: принятая actuator-команда обновляет общий таймер последней команды.\n\n# Flash configuration\n\nПоследняя 1 KB страница Flash STM32F103C8 зарезервирована по адресу:\n\n```text\n0x0800FC00\n```\n\nLinker script оставляет firmware 63 KB Flash. Конфигурация защищена magic/version/CRC32. Изменение параметров через `GetSet` работает в RAM и **не сохраняется автоматически**.\n\nСтандартный `uavcan.protocol.param.ExecuteOpcode`:\n\n```text\nSAVE  = 0\nERASE = 1\n```\n\nSAVE и восстановление после полного отключения питания проверены аппаратно. Текущая схема одно-страничная и не гарантирует power-fail-safe непосредственно во время erase/program; при необходимости можно перейти на двухстраничный journal.\n\n# OLED и LED\n\nSSD1306 128x32 имеет адрес `0x3C`. Экран показывает CAN/FS, состояние PCA0/PCA1, RX count и CAN diagnostics (TEC/REC/overflow/flags). При `PCA_COUNT=1` второй драйвер отображается как `P1 --`. Отказ OLED не должен останавливать PCA9685.\n\nДиагностические LED текущей платы:\n\n```text\nPB4  LED1 RUN\nPB3  LED2 FAILSAFE\nPA15 LED3 ERROR\n```\n\nОни active-high. JTAG отключается с сохранением SWD, чтобы освободить PB3/PB4; SWD остаётся на PA13/PA14.\n\n# Исправление TIM2\n\nTIM2 используется как 16-битный таймер 1 MHz с `ARR=0xFFFF`. Update IRQ увеличивает программную старшую часть счётчика; на этой основе реализованы `micros32()`/`micros64()`. Это устраняет прежнее переполнение каждые 65.536 ms, которое ломало failsafe и остальные интервалы.\n\n# Тесты\n\nАппаратные тесты находятся в `tests/`:\n\n```text\ntest_params.py\ntest_params_read_outputs.py\ntest_param_write_output.py\ntest_onoff.py\ntest_pulse.py\ntest_pulse_restart.py\ntest_failsafe_output.py\ntest_pulse_failsafe.py\n```\n\nПроверено на реальном железе:\n\n```text\n[OK] CAN 500 kbit/s\n[OK] NodeStatus / GetNodeInfo\n[OK] Parameter GetSet\n[OK] Parameter SAVE\n[OK] Flash restore after cold power cycle\n[OK] PCA_COUNT=1 / PCA0 0x40\n[OK] OLED 0x3C\n[OK] I2C2 PB10/PB11\n[OK] corrected TIM2 timebase\n[OK] PWM\n[OK] ON_OFF\n[OK] PULSE IGNORE\n[OK] PULSE RESTART\n[OK] ON_OFF failsafe FS_STATE=0/1\n[OK] PULSE interrupted by failsafe\n```\n\nВ тестах ON_OFF с 50 Hz PCA9685 измерено примерно `1000 us -> 0.16 V`, `2000 us -> 0.32 V`. PULSE IGNORE/RESTART и failsafe с `FS_TIMEOUT=700 ms` отработали согласно заданной логике.\n\nВторой физический PCA9685 (`0x41`, OUT17..OUT32) программно предусмотрен, но пока не отмечается как аппаратно проверенный.\n\n# SocketCAN для тестов\n\n```bash\nsudo ip link set can0 down\nsudo ip link set can0 type can bitrate 500000\nsudo ip link set can0 up\ncandump can0\n```\n\nДля используемого USB-CAN `restart-ms` не требуется и может не поддерживаться. В корне репозитория находится `can0.sh`.\n\n# Следующие проверки\n\n- физический PCA9685 #1 при `PCA_COUNT=2`;\n- применение сохранённого `CAN_BITRATE` при CAN startup;\n- recovery при ошибочно сохранённом Node ID/bitrate;\n- CAN BUS-OFF/recovery и длительный stress test;\n- интеграция всех требуемых выходов с ArduPilot Rover;\n- при необходимости двухстраничное power-fail-safe хранение конфигурации.\n
+Сложную логику Rover не следует переносить в STM32 без необходимости.

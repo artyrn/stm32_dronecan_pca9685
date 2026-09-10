@@ -1,0 +1,11 @@
+TODO: CAN stress test
+- проверить STM32 на загруженной CAN 500 kbit/s;
+- генерировать фоновый трафик через cangen;
+- измерять загрузку через canbusload;
+- проверить 20 / 40 / 60 / 80 % bus load;
+- одновременно передавать DroneCAN actuator commands;
+- одновременно читать/писать параметры;
+- контролировать OLED: CAN OK, E, TEC/REC, RX overflow O;
+- O должен оставаться 0;
+- проверить failsafe под нагрузкой;
+- после теста решить, нужны ли bxCAN acceptance filters.
